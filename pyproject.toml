@@ -1,0 +1,13 @@
+[project]
+name = "duwo-laundry-monitor"
+version = "1.0.0"
+description = "Monitor DUWO laundry room availability and auto-book machines via Telegram"
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.31.0",
+    "beautifulsoup4>=4.12.0",
+    "qrcode[pil]>=7.4",
+]
+
+[project.scripts]
+duwo = "duwo_monitor:main"

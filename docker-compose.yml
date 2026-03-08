@@ -1,0 +1,7 @@
+services:
+  duwo-monitor:
+    build: .
+    container_name: duwo-laundry-bot
+    restart: unless-stopped
+    env_file:
+      - .env
