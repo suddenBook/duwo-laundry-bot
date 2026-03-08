@@ -5,9 +5,10 @@ import io
 import os
 import re
 import time
+import traceback
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import urllib3
 import requests
@@ -200,7 +201,12 @@ class TelegramBot:
 class DUWOClient:
     """Handles all communication with the DUWO laundry website."""
 
-    def __init__(self):
+    # Login cooldown: exponential backoff on repeated failures
+    LOGIN_COOLDOWN_BASE = 60       # first retry after 60s
+    LOGIN_COOLDOWN_MAX = 1800      # cap at 30 minutes
+    LOGIN_COOLDOWN_MULTIPLIER = 2
+
+    def __init__(self, notify_callback=None):
         self.session = requests.Session()
         self.session.verify = False
         self.session.headers.update(
@@ -215,6 +221,11 @@ class DUWOClient:
         self.start_url = None
         self.last_known_balance = None
         self.last_error = None
+        # Login rate-limiting state
+        self._login_fail_count = 0
+        self._login_cooldown_until = 0.0    # timestamp: don't attempt login before this
+        self._locked_until = 0.0            # timestamp: account lockout detected
+        self._notify = notify_callback      # optional callable(str) for Telegram alerts
 
     def _clear_error(self):
         self.last_error = None
@@ -222,6 +233,109 @@ class DUWOClient:
     def _set_error(self, message: str):
         self.last_error = message
         print(f"[WARN] {message}")
+
+    def _send_alert(self, message: str):
+        """Send a Telegram notification if callback is configured."""
+        if self._notify:
+            try:
+                self._notify(message)
+            except Exception:
+                pass
+
+    def _is_login_blocked(self) -> bool:
+        """Check if we should NOT attempt login due to cooldown or lockout."""
+        now = time.time()
+        if self._locked_until > now:
+            remaining = int(self._locked_until - now)
+            mins, secs = divmod(remaining, 60)
+            print(f"[LOCK] Account locked, {mins}m{secs}s remaining")
+            return True
+        if self._login_cooldown_until > now:
+            remaining = int(self._login_cooldown_until - now)
+            print(f"[WAIT] Login cooldown, {remaining}s remaining")
+            return True
+        return False
+
+    def _on_login_success(self):
+        """Reset cooldown state after successful login."""
+        if self._login_fail_count > 0:
+            self._send_alert("Login restored successfully.")
+        self._login_fail_count = 0
+        self._login_cooldown_until = 0.0
+
+    def _on_login_failure(self):
+        """Apply exponential backoff after a login failure."""
+        self._login_fail_count += 1
+        cooldown = min(
+            self.LOGIN_COOLDOWN_BASE * (self.LOGIN_COOLDOWN_MULTIPLIER ** (self._login_fail_count - 1)),
+            self.LOGIN_COOLDOWN_MAX,
+        )
+        self._login_cooldown_until = time.time() + cooldown
+        print(f"[WAIT] Login failed ({self._login_fail_count}x), next attempt in {int(cooldown)}s")
+        if self._login_fail_count == 1:
+            self._send_alert(
+                f"<b>Login failed</b>\nNext attempt in {int(cooldown)}s.\n"
+                f"If this persists, check your credentials."
+            )
+
+    def _detect_lockout(self, resp_text: str) -> bool:
+        """Check login response for account lockout, set _locked_until if found.
+
+        Known lockout page format from DUWO:
+            "Locked after too many login attempts !"
+            "Try again @:20:28:19"
+            "click here after :20:28:19"
+        """
+        lower = resp_text.lower()
+        # Extract unlock time — formats: "@:HH:MM:SS", "after :HH:MM:SS", etc.
+        time_patterns = [
+            r"(?:try again|after)\s*@?\s*:?\s*(\d{1,2}:\d{2}(?::\d{2})?)",
+            r"click here after\s*:?\s*(\d{1,2}:\d{2}(?::\d{2})?)",
+        ]
+        for pat in time_patterns:
+            m = re.search(pat, lower)
+            if m:
+                return self._set_lockout_from_time(m.group(1))
+        # Generic lockout detection without parseable time
+        if any(kw in lower for kw in (
+            "locked after too many",
+            "too many login",
+            "too many attempts",
+            "geblokkeerd",
+            "error 101",
+        )):
+            # Default lockout: 30 minutes
+            self._locked_until = time.time() + 1800
+            unlock_str = datetime.fromtimestamp(self._locked_until).strftime("%H:%M")
+            print(f"[LOCK] Account locked! Estimated unlock at {unlock_str}")
+            self._send_alert(
+                f"<b>Account locked!</b>\n"
+                f"Too many login attempts detected.\n"
+                f"Will retry around {unlock_str}."
+            )
+            return True
+        return False
+
+    def _set_lockout_from_time(self, time_str: str) -> bool:
+        """Parse an HH:MM or HH:MM:SS lockout time and set _locked_until."""
+        try:
+            parts = time_str.split(":")
+            h, m = int(parts[0]), int(parts[1])
+            now = datetime.now()
+            unlock = now.replace(hour=h, minute=m, second=0, microsecond=0)
+            if unlock <= now:
+                unlock += timedelta(days=1)
+            self._locked_until = unlock.timestamp()
+            unlock_str = unlock.strftime("%H:%M")
+            print(f"[LOCK] Account locked until {unlock_str}")
+            self._send_alert(
+                f"<b>Account locked!</b>\n"
+                f"Too many login attempts.\n"
+                f"Auto-retry at {unlock_str}."
+            )
+            return True
+        except (ValueError, IndexError):
+            return False
 
     def _is_auth_redirect(self, resp: requests.Response) -> bool:
         """Detect the site's JS redirect that indicates an invalid session."""
@@ -238,7 +352,12 @@ class DUWOClient:
     def _get(
         self, url: str, *, init_location: bool = False, allow_retry: bool = True
     ) -> requests.Response:
-        """GET with auth validation and optional location/session re-init."""
+        """GET with auth validation and optional location/session re-init.
+
+        Session validity is checked passively: if the response indicates an
+        auth redirect we re-login once.  There is no proactive checkAuth.php
+        request — this dramatically reduces login-related traffic.
+        """
         self.ensure_login()
         if init_location:
             self._init_location()
@@ -331,8 +450,12 @@ class DUWOClient:
         return amount, normalized
 
     def login(self) -> bool:
+        if self._is_login_blocked():
+            return False
         try:
-            self.session.get(f"{BASE_URL}/login/index.php", timeout=20)
+            init_resp = self.session.get(f"{BASE_URL}/login/index.php", timeout=20)
+            if self._detect_lockout(init_resp.text):
+                return False
             resp = self.session.post(
                 f"{BASE_URL}/login/submit.php",
                 data={"UserInput": EMAIL, "PwdInput": PASSWORD},
@@ -353,12 +476,18 @@ class DUWOClient:
                 # (required for booking/cancel operations to work)
                 self._init_location()
                 self.logged_in = True
+                self._on_login_success()
                 print("[OK] Login successful")
                 return True
+            # Check for account lockout in the failed response
+            if self._detect_lockout(resp.text):
+                return False
             print("[FAIL] Login failed")
+            self._on_login_failure()
             return False
         except Exception as e:
             print(f"[ERROR] Login: {e}")
+            self._on_login_failure()
             return False
 
     def _init_location(self):
@@ -366,18 +495,13 @@ class DUWOClient:
         self.session.get(f"{BASE_URL}/findmachinetypes.php", timeout=20)
 
     def ensure_login(self):
+        """Ensure we are logged in. Does NOT proactively probe checkAuth.php.
+
+        Session validity is verified passively by _get() — if a page response
+        indicates an auth redirect, _get() will call login() at that point.
+        This avoids unnecessary requests to the login subsystem.
+        """
         if not self.logged_in:
-            self.login()
-            return
-        try:
-            resp = self.session.get(f"{BASE_URL}/login/checkAuth.php", timeout=20)
-            if self._is_auth_redirect(resp):
-                print("[INFO] Session expired or incomplete, re-logging in...")
-                self.logged_in = False
-                self.login()
-        except Exception:
-            print("[WARN] Session check failed, re-logging in...")
-            self.logged_in = False
             self.login()
 
     def get_availability(self) -> list[MachineStatus]:
@@ -1006,8 +1130,8 @@ def run():
     print(f"  Dryer notify threshold: {DRYER_NOTIFY_THRESHOLD}")
     print("=" * 50)
 
-    duwo = DUWOClient()
     bot = TelegramBot()
+    duwo = DUWOClient(notify_callback=bot.send)
 
     if not duwo.login():
         print("[FATAL] Cannot login. Check credentials.")
@@ -1102,8 +1226,10 @@ def run():
             print("\n[INFO] Stopped")
             break
         except Exception:
+            traceback.print_exc()
             print("[ERROR] Main loop error")
-            duwo.logged_in = False
+            # Don't blindly reset logged_in — let ensure_login/login
+            # handle re-auth with proper cooldown on next iteration.
 
         time.sleep(2)
 
