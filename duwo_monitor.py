@@ -23,6 +23,16 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ============== Config ==============
 
+# Load .env file if present (without requiring python-dotenv)
+_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.exists(_env_path):
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+
 _REQUIRED_VARS = ["DUWO_EMAIL", "DUWO_PASSWORD", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
 _missing = [v for v in _REQUIRED_VARS if not os.environ.get(v)]
 if _missing:
@@ -679,25 +689,44 @@ class DUWOClient:
         return booked
 
     def get_balance(self) -> str | None:
+        """Get account balance via AnnouncmentBooking.php.
+
+        The DUWO main page does not include balance in its HTML (it's AJAX-
+        loaded in the browser).  However, the booking confirmation page
+        (AnnouncmentBooking.php) always shows "Your Balance : € X.XX",
+        so we use that as a reliable source.  We request it with any valid
+        slot value — this only prepares a booking preview, it does NOT
+        actually create a booking.
+        """
         self._clear_error()
-        urls = (
-            f"{BASE_URL}/main.php?page=home",
-            self.start_url or f"{BASE_URL}/StartSite.php",
-            f"{BASE_URL}/main.php",
-        )
-        for url in urls:
-            try:
-                resp = self._get(url)
-                balance = self._extract_balance(resp.text)
-                if balance:
-                    self.last_known_balance = balance
-                    return balance
-            except Exception:
-                continue
-        self._set_error(
-            "Balance unavailable on the DUWO page. It may currently be hidden by risk control."
-        )
-        return None
+        try:
+            # Get any available slot to use as a parameter
+            slots = self.get_booking_slots(WASHER_TYPE_ID)
+            if not slots:
+                slots = self.get_booking_slots(DRYER_TYPE_ID)
+            if not slots:
+                self._set_error("No slots available to query balance.")
+                return self.last_known_balance
+            resp = self._get(
+                f"{BASE_URL}/AnnouncmentBooking.php?value={slots[0].raw_value}",
+                init_location=True,
+            )
+            m = re.search(
+                r"Your Balance\s*:.*?[€\u20ac&]?\s*([\d]+(?:[.,]\d{1,2})?)",
+                resp.text, re.DOTALL,
+            )
+            if m:
+                self.last_known_balance = m.group(1)
+                return self.last_known_balance
+            # Fallback: try extracting from HTML
+            balance = self._extract_balance(resp.text)
+            if balance:
+                self.last_known_balance = balance
+                return balance
+        except Exception:
+            pass
+        self._set_error("Could not retrieve balance from DUWO.")
+        return self.last_known_balance
 
     def get_balance_float(self) -> float | None:
         bal = self.get_balance()
@@ -1082,6 +1111,16 @@ def handle_command(cmd: str, duwo: DUWOClient, bot: TelegramBot):
     if m:
         amount_input = m.group(1)
         normalized_amount = amount_input.replace(",", ".")
+        try:
+            amount_value = int(float(normalized_amount))
+        except ValueError:
+            amount_value = 0
+        if amount_value < 20:
+            bot.send("Minimum top-up amount is €20.")
+            return
+        if "." in normalized_amount or "," in amount_input:
+            bot.send("Only whole euro amounts are accepted (e.g. /topup 20).")
+            return
         method_key = m.group(2) or "ideal"
         method = PAYMENT_METHODS.get(method_key)
         if not method:
@@ -1133,9 +1172,19 @@ def run():
     bot = TelegramBot()
     duwo = DUWOClient(notify_callback=bot.send)
 
-    if not duwo.login():
-        print("[FATAL] Cannot login. Check credentials.")
-        return
+    # Retry initial login with backoff — don't exit on lockout
+    while not duwo.login():
+        if duwo._locked_until > time.time():
+            wait = int(duwo._locked_until - time.time()) + 5
+            print(f"[LOCK] Waiting {wait}s for lockout to expire...")
+            time.sleep(wait)
+        elif duwo._login_cooldown_until > time.time():
+            wait = int(duwo._login_cooldown_until - time.time()) + 1
+            print(f"[WAIT] Cooldown {wait}s...")
+            time.sleep(wait)
+        else:
+            print("[FATAL] Cannot login. Check credentials.")
+            return
 
     bot.flush_old_updates()
     bot.set_commands()
