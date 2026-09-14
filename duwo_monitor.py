@@ -97,7 +97,7 @@ NOTIFY_LOW_BALANCE = _env_bool("NOTIFY_LOW_BALANCE", False)
 # So DUWO's "finished" is useless as a "go collect it" signal and we run our
 # own clock instead, refined from /done feedback.
 WASHER_CYCLE_MINUTES = _env_int("WASHER_CYCLE_MINUTES", 55)
-DRYER_CYCLE_MINUTES = _env_int("DRYER_CYCLE_MINUTES", 44)
+DRYER_CYCLE_MINUTES = _env_int("DRYER_CYCLE_MINUTES", 40)
 CYCLE_HEADSUP_MINUTES = _env_int("CYCLE_HEADSUP_MINUTES", 5)
 CYCLE_LOOKBACK_HOURS = _env_int("CYCLE_LOOKBACK_HOURS", 6)
 STATE_PATH = (os.environ.get("STATE_PATH") or "/data/state.json").strip()
@@ -157,6 +157,9 @@ class CycleTracker:
     """
 
     EWMA_ALPHA = 0.4
+    # The dryer really does run its advertised 40 minutes, so only the washer
+    # -- whose door lags DUWO's timer by ~20 min -- is worth learning.
+    CALIBRATED = ("Washer",)
     MIN_MINUTES = 15.0
     MAX_MINUTES = 150.0
     BATCH_WINDOW = timedelta(minutes=15)
@@ -180,6 +183,10 @@ class CycleTracker:
             print(f"[WARN] Could not read state file {self.path}: {exc}")
             return False
         for machine, value in (data.get("duration") or {}).items():
+            if machine not in self.CALIBRATED:
+                # Not learned, so the configured value wins over whatever an
+                # older state file happens to hold.
+                continue
             try:
                 self.duration[machine] = self._clamp(float(value))
             except (TypeError, ValueError):
@@ -280,7 +287,7 @@ class CycleTracker:
         batch = [c for c in pending if newest.started_at - c.started_at <= self.BATCH_WINDOW]
         observed = (now - newest.started_at).total_seconds() / 60.0
         learned = None
-        if self.MIN_MINUTES <= observed <= self.MAX_MINUTES:
+        if newest.machine in self.CALIBRATED and self.MIN_MINUTES <= observed <= self.MAX_MINUTES:
             previous = self.minutes_for(newest.machine)
             learned = self._clamp(
                 self.EWMA_ALPHA * observed + (1 - self.EWMA_ALPHA) * previous
@@ -395,6 +402,7 @@ class TelegramBot:
             {"command": "slots_dryer", "description": "Dryer slots"},
             {"command": "book", "description": "Book N washers"},
             {"command": "book_dryer", "description": "Book N dryers"},
+            {"command": "book_at", "description": "Reserve any time window"},
             {"command": "bookings", "description": "Your bookings"},
             {"command": "cancel", "description": "Cancel a booking"},
             {"command": "balance", "description": "Account balance"},
@@ -447,6 +455,7 @@ class DUWOClient:
         self._login_cooldown_until = 0.0    # timestamp: don't attempt login before this
         self._locked_until = 0.0            # timestamp: account lockout detected
         self._notify = notify_callback      # optional callable(str) for Telegram alerts
+        self._location_set = False          # has LocNR been set in this session?
 
     def _clear_error(self):
         self.last_error = None
@@ -681,9 +690,11 @@ class DUWOClient:
                         redirect = f"{BASE_URL}/{redirect}"
                     self.start_url = redirect
                     self.session.get(redirect, timeout=20)
-                # Load findmachinetypes.php to set LocNR in PHP session
-                # (required for booking/cancel operations to work)
-                self._init_location()
+                # LocNR is deliberately NOT set here: it sticks to the PHP
+                # session and flips BookingOverview.php from our own bookings
+                # to the whole location.  Calls that need it pass
+                # init_location=True.
+                self._location_set = False
                 self.logged_in = True
                 self._on_login_success()
                 print("[OK] Login successful")
@@ -700,8 +711,9 @@ class DUWOClient:
             return False
 
     def _init_location(self):
-        """Load findmachinetypes.php to set LocNR in PHP session."""
+        """Load findmachinetypes.php to set LocNR in the PHP session."""
         self.session.get(f"{BASE_URL}/findmachinetypes.php", timeout=20)
+        self._location_set = True
 
     def ensure_login(self):
         """Ensure we are logged in. Does NOT proactively probe checkAuth.php.
@@ -978,9 +990,14 @@ class DUWOClient:
         return bookings
 
     def cancel_booking(self, res_nr: str) -> bool:
+        """Cancel one of our bookings.
+
+        Uses get_own_bookings() rather than the hour-grid calendar, because a
+        window booked by create_timed_booking is not rendered there at all.
+        """
         self._clear_error()
         try:
-            before_bookings = self.get_bookings()
+            before_bookings = self.get_own_bookings()
             if before_bookings is None:
                 self._set_error("Cancellation aborted because current bookings could not be loaded.")
                 return False
@@ -1008,7 +1025,7 @@ class DUWOClient:
                 print(f"[FAIL] cancel_booking ResNr={res_nr}: server error")
                 return False
 
-            after_bookings = self.get_bookings()
+            after_bookings = self.get_own_bookings()
             if after_bookings is None:
                 self._set_error(
                     f"Cancellation for booking {res_nr} was submitted, but verification failed."
@@ -1024,6 +1041,149 @@ class DUWOClient:
         except Exception as e:
             self._set_error(f"cancel_booking failed: {e}")
             return False
+
+    def _latest_booking_event(self) -> tuple[str, datetime] | None:
+        """Most recent 'Create Booking' in our own activity log."""
+        try:
+            resp = self._get(f"{BASE_URL}/UserLog.php")
+            newest = None
+            for row in BeautifulSoup(resp.text, "html.parser").find_all("tr"):
+                cells = [td.get_text(" ", strip=True) for td in row.find_all("td")]
+                if len(cells) < 3 or cells[2] != "Create Booking":
+                    continue
+                try:
+                    stamp = datetime.strptime(cells[0], "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    continue
+                match = re.search(r"BookingNR\s*:\s*(\d+)", " ".join(cells))
+                if match and (newest is None or stamp > newest[1]):
+                    newest = (match.group(1), stamp)
+            return newest
+        except Exception:
+            return None
+
+    def create_timed_booking(
+        self, machine_type_id: int, date: str, start: str, end: str
+    ) -> str | None:
+        """Reserve an arbitrary window, not just the whole hours the UI offers.
+
+        DUWO's calendar only renders hour-aligned blocks, but the backend
+        stores real windows -- a walk-up start at 16:12 produces 16:12->16:47 --
+        and CreateBooking.php accepts a hand-made value just fine.  It then
+        returns HTTP 500 while trying to render the confirmation into the hour
+        grid, *after* the booking has already been committed, so the status
+        code must not be read as failure.  The hour grid also cannot display
+        the result, which is why verification goes through UserLog.php.
+
+        Returns the new BookingNR, or None.
+        """
+        self._clear_error()
+        try:
+            location = self._location_id(machine_type_id)
+            if location is None:
+                self._set_error("Could not work out the laundry room id.")
+                return None
+            before = self._latest_booking_event()
+            value = f"{location}|{date}|{start}:00|{end}"
+            for step, url in (
+                ("AnnouncmentBooking", f"{BASE_URL}/AnnouncmentBooking.php?value={value}"),
+                ("ConfirmCreateBooking", f"{BASE_URL}/ConfirmCreateBooking.php?value={value}"),
+                ("CreateBooking", f"{BASE_URL}/CreateBooking.php?value={value}"),
+            ):
+                resp = self._get(url, init_location=(step == "AnnouncmentBooking"))
+                print(f"[BOOK] {step} -> HTTP {resp.status_code}")
+
+            after = self._latest_booking_event()
+            if after and (before is None or after[0] != before[0]):
+                print(f"[OK] Timed booking {after[0]}: {date} {start}-{end}")
+                return after[0]
+            self._set_error(
+                f"DUWO did not record a booking for {date} {start}-{end}."
+            )
+            return None
+        except Exception as exc:
+            self._set_error(f"Timed booking failed: {exc}")
+            return None
+
+    def _location_id(self, machine_type_id: int) -> str | None:
+        """Read the room id off a real slot rather than hard-coding it."""
+        slots = self.get_booking_slots(machine_type_id)
+        if slots:
+            return slots[0].location_id
+        return None
+
+    def _ensure_own_scope(self):
+        """Drop LocNR so BookingOverview.php reports OUR bookings again.
+
+        LocNR sticks to the PHP session and flips that page to the whole
+        location, so the only way back is a fresh session.
+        """
+        if self._location_set:
+            self.logged_in = False
+            self.login()
+
+    def get_own_bookings(self) -> list[dict] | None:
+        """Our own bookings, including windows the hour grid cannot render.
+
+        The calendar's BookedByYou blocks only cover hour-aligned slots, so a
+        booking made by create_timed_booking is invisible there.  This view has
+        all of them, with the ResNr needed to cancel.
+        """
+        self._clear_error()
+        try:
+            self._ensure_own_scope()
+            if self._location_set:
+                # Refuse rather than risk presenting the whole location's
+                # bookings as the user's own, complete with cancel ids.
+                self._set_error(
+                    "Could not switch back to your own bookings. Try again shortly."
+                )
+                return None
+            resp = self._get(f"{BASE_URL}/BookingOverview.php")
+            table = BeautifulSoup(resp.text, "html.parser").find(id="BookingOverviewTable")
+            if table is None:
+                self._set_error("Failed to load your bookings from DUWO.")
+                return None
+            now = datetime.now()
+            bookings = []
+            for row in table.find_all("tr"):
+                cells = [td.get_text(" ", strip=True) for td in row.find_all("td")]
+                if len(cells) < 4:
+                    continue
+                day = re.match(r"(\d{2})-(\d{2})$", cells[0])
+                window = re.match(r"(\d{2}):(\d{2})->(\d{2}):(\d{2})", cells[1])
+                if not day or not window:
+                    continue
+                res = re.search(r"RemoveBooking\((\d+)\)", str(row))
+                status = next(
+                    (
+                        name
+                        for tag in row.find_all("p")
+                        for name in (tag.get("class") or [])
+                        if name.startswith("Booking")
+                    ),
+                    "",
+                )
+                bookings.append(
+                    {
+                        "id": res.group(1) if res else "",
+                        "machine": "Washer" if "wash" in cells[3].lower() else "Dryer",
+                        "start": self._booking_datetime(
+                            now,
+                            int(day.group(2)),
+                            int(day.group(1)),
+                            int(window.group(1)),
+                            int(window.group(2)),
+                        ),
+                        "end_label": f"{window.group(3)}:{window.group(4)}",
+                        "status": status,
+                    }
+                )
+            bookings.sort(key=lambda b: b["start"])
+            return bookings
+        except Exception as exc:
+            self._set_error(f"Failed to load your bookings from DUWO: {exc}")
+            return None
 
     def get_location_bookings(self) -> list[dict] | None:
         """Upcoming reservations for the whole laundry room.
@@ -1203,6 +1363,7 @@ HELP_TEXT = """<b>DUWO Laundry Bot</b>
 /slots_dryer - Dryer slots
 /book N - Book N washers
 /book_dryer N - Book N dryers
+/book_at TYPE FROM TO - Reserve any window
 /bookings - Your bookings
 /cancel ID - Cancel a booking
 /balance - Account balance
@@ -1211,6 +1372,7 @@ HELP_TEXT = """<b>DUWO Laundry Bot</b>
 
 <b>Examples:</b>
 /book 2
+/book_at washer 23:17 23:57
 /cancel 12345
 
 Start and ready alerts are sent for your own machines only; nothing else is pushed. DUWO frees a machine well before its door actually opens, so the bot runs its own clock: washer {washer} min, dryer {dryer} min. Send /done when you really open the door and it learns your timings.
@@ -1321,16 +1483,26 @@ def handle_command(
 
     # /bookings (must be before /book to avoid regex collision)
     if lower == "/bookings":
-        bookings = duwo.get_bookings()
+        bookings = duwo.get_own_bookings()
         if bookings is None:
             bot.send(duwo.last_error or "Failed to load bookings from DUWO.")
             return
-        if not bookings:
+        upcoming = [
+            b for b in bookings if b["status"] != "BookingFinished"
+        ]
+        if not upcoming:
             bot.send("No active bookings.")
             return
         lines = ["<b>Your bookings:</b>", ""]
-        for b in bookings:
-            lines.append(f"  {b['type']} | {b['date']} {b['time']} | ID: <code>{b['id']}</code>")
+        for b in upcoming:
+            state = {"BookingReady": "reserved", "BookingBusy": "running"}.get(
+                b["status"], b["status"] or "?"
+            )
+            when = b["start"].strftime("%d-%m %H:%M")
+            lines.append(
+                f"  {b['machine']} | {when}-{b['end_label']} | {state}"
+                f" | ID: <code>{html.escape(b['id'])}</code>"
+            )
         lines.append("")
         lines.append("Cancel: /cancel ID")
         bot.send("\n".join(lines))
@@ -1352,6 +1524,63 @@ def handle_command(
     # /cancel without args
     if lower == "/cancel":
         bot.send("Usage: /cancel ID\nSend /bookings to see your booking IDs.")
+        return
+
+    # /book_at TYPE HH:MM HH:MM [YYYY-MM-DD]
+    m = re.match(
+        r"/book_at\s+(washer|dryer)\s+(\d{1,2}:\d{2})\s+(\d{1,2}:\d{2})"
+        r"(?:\s+(\d{4}-\d{2}-\d{2}))?\s*$",
+        lower,
+    )
+    if m:
+        kind, start_raw, end_raw, date_raw = m.groups()
+        try:
+            start_t = datetime.strptime(start_raw, "%H:%M").time()
+            end_t = datetime.strptime(end_raw, "%H:%M").time()
+        except ValueError:
+            bot.send("Times must look like HH:MM, e.g. /book_at washer 23:17 23:57")
+            return
+        now = datetime.now()
+        if date_raw:
+            try:
+                day = datetime.strptime(date_raw, "%Y-%m-%d").date()
+            except ValueError:
+                bot.send("Date must look like YYYY-MM-DD.")
+                return
+        else:
+            day = now.date()
+            if datetime.combine(day, start_t) < now:
+                day = day + timedelta(days=1)
+        if datetime.combine(day, end_t) <= datetime.combine(day, start_t):
+            bot.send("The end time must be after the start time.")
+            return
+
+        type_id = WASHER_TYPE_ID if kind == "washer" else DRYER_TYPE_ID
+        start_s = start_t.strftime("%H:%M")
+        end_s = end_t.strftime("%H:%M")
+        date_s = day.strftime("%Y-%m-%d")
+        bot.send(f"Reserving {kind} {date_s} {start_s}-{end_s}...")
+        booking_nr = duwo.create_timed_booking(type_id, date_s, start_s, end_s)
+        if booking_nr:
+            bot.send(
+                f"[OK] Reserved {kind} {date_s} {start_s}-{end_s}\n"
+                f"Booking {html.escape(booking_nr)}\n\n"
+                f"It will not show on DUWO's hour calendar. "
+                f"Use /bookings to see or cancel it."
+            )
+        else:
+            bot.send(f"[FAIL] {html.escape(duwo.last_error or 'Could not reserve that window.')}")
+        return
+
+    # /book_at without usable arguments
+    if lower.startswith("/book_at"):
+        bot.send(
+            "Usage: /book_at washer|dryer HH:MM HH:MM [YYYY-MM-DD]\n"
+            "Examples: /book_at washer 23:17 23:57\n"
+            "          /book_at dryer 19:30 20:10 2026-09-16\n\n"
+            "Books any window, not just whole hours. "
+            "Defaults to today, or tomorrow if that time has passed."
+        )
         return
 
     # /book N

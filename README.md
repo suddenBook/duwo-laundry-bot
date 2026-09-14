@@ -27,8 +27,11 @@ its own clock, which `/done` calibrates against reality over time.
 - Learns your real cycle length from `/done` feedback (EWMA, persisted to disk)
 - Timers survive a container restart
 - **Quiet by default** — nothing else is ever pushed; ask with `/status`
+- Reserves **any** time window, not just the whole hours DUWO's calendar
+  offers: `/book_at washer 23:17 23:57`
+- `/status` also lists what the room has reserved ahead, by machine type
 - `/status`, `/cycles`, `/done`, `/slots`, `/slots_dryer`, `/book`,
-  `/book_dryer`, `/bookings`, `/cancel`, `/balance`, `/qr`
+  `/book_dryer`, `/book_at`, `/bookings`, `/cancel`, `/balance`, `/qr`
 - Verifies booking and cancellation results instead of trusting a single
   response page
 
@@ -44,8 +47,10 @@ Required:
 
 Cycle tracking:
 
-- `WASHER_CYCLE_MINUTES` (default `55`) — real washer duration, start to door open
-- `DRYER_CYCLE_MINUTES` (default `44`) — real dryer duration
+- `WASHER_CYCLE_MINUTES` (default `55`) — real washer duration, start to door open;
+  the only value `/done` calibrates
+- `DRYER_CYCLE_MINUTES` (default `40`) — dryer duration; accurate as advertised,
+  so it is never adjusted by `/done`
 - `CYCLE_HEADSUP_MINUTES` (default `5`) — warning before ready, so you can walk down
 - `CYCLE_LOOKBACK_HOURS` (default `6`) — how far back to look for machine starts
 - `STATE_PATH` (default `/data/state.json`) — where timers and learned
@@ -88,7 +93,14 @@ STATE_PATH=./data/state.json uv run python duwo_monitor.py
 - `/done` closes out every machine started within 15 minutes of the most recent
   one, which is how loads are actually run — two or three back to back. It
   calibrates from the *last* machine to start, since that is the one that
-  decides when the batch can be emptied.
+  decides when the batch can be emptied. Only the washer is learned; the dryer
+  really does take its advertised 40 minutes.
+- `/book_at` books a window DUWO's own UI cannot express. `CreateBooking.php`
+  accepts it but then returns HTTP 500 while trying to draw the result into an
+  hour grid — *after* committing — so the status code is ignored and the
+  booking is confirmed against `UserLog.php` instead. Such a booking is
+  invisible on the hour calendar; `/bookings` reads `BookingOverview.php`
+  so it can still list and cancel it.
 - On first run there is no state file, so machines already in the DUWO log are
   recorded silently rather than firing a burst of stale notifications.
 - `/balance` depends on what the DUWO site renders for the account. If DUWO
