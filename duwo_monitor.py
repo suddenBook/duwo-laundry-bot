@@ -298,6 +298,15 @@ class CycleTracker:
         return batch, observed, learned
 
     def prune(self, now: datetime):
+        # A load nobody ever confirmed with /done should not sit in /cycles for
+        # ever, and should not be what the next /done closes out.
+        stale = now - timedelta(hours=CYCLE_LOOKBACK_HOURS)
+        for cycle in self.cycles.values():
+            if cycle.collected_at is None and cycle.notified_done and cycle.started_at < stale:
+                cycle.collected_at = cycle.started_at + timedelta(
+                    minutes=self.minutes_for(cycle.machine)
+                )
+
         cutoff = now - timedelta(hours=max(CYCLE_LOOKBACK_HOURS * 2, 24))
         for key in [k for k, c in self.cycles.items() if c.started_at < cutoff]:
             del self.cycles[key]
