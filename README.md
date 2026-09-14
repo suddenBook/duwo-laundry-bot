@@ -29,7 +29,8 @@ its own clock, which `/done` calibrates against reality over time.
 - **Quiet by default** — nothing else is ever pushed; ask with `/status`
 - Reserves **any** time window, not just the whole hours DUWO's calendar
   offers: `/book_at washer 23:17 23:57`
-- `/status` also lists what the room has reserved ahead, by machine type
+- `/status` shows free machines, your balance, your own bookings, and what
+  the rest of the room has reserved ahead — all in one message
 - `/status`, `/cycles`, `/done`, `/slots`, `/slots_dryer`, `/book`,
   `/book_dryer`, `/book_at`, `/bookings`, `/cancel`, `/balance`, `/qr`
 - Verifies booking and cancellation results instead of trusting a single
@@ -94,7 +95,8 @@ STATE_PATH=./data/state.json uv run python duwo_monitor.py
   one, which is how loads are actually run — two or three back to back. It
   calibrates from the *last* machine to start, since that is the one that
   decides when the batch can be emptied. Only the washer is learned; the dryer
-  really does take its advertised 40 minutes.
+  really does take its advertised 40 minutes, so a finished dryer closes itself
+  out and never asks for `/done`.
 - `/book_at` books a window DUWO's own UI cannot express. `CreateBooking.php`
   accepts it but then returns HTTP 500 while trying to draw the result into an
   hour grid — *after* committing — so the status code is ignored and the

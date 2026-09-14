@@ -456,6 +456,7 @@ class DUWOClient:
         self._locked_until = 0.0            # timestamp: account lockout detected
         self._notify = notify_callback      # optional callable(str) for Telegram alerts
         self._location_set = False          # has LocNR been set in this session?
+        self._cache: dict[str, tuple[float, list]] = {}
 
     def _clear_error(self):
         self.last_error = None
@@ -1025,6 +1026,9 @@ class DUWOClient:
                 print(f"[FAIL] cancel_booking ResNr={res_nr}: server error")
                 return False
 
+            # The verification read below must not be served from the
+            # pre-cancellation cache.
+            self._cache.clear()
             after_bookings = self.get_own_bookings()
             if after_bookings is None:
                 self._set_error(
@@ -1092,6 +1096,7 @@ class DUWOClient:
             ):
                 resp = self._get(url, init_location=(step == "AnnouncmentBooking"))
                 print(f"[BOOK] {step} -> HTTP {resp.status_code}")
+            self._cache.clear()
 
             after = self._latest_booking_event()
             if after and (before is None or after[0] != before[0]):
@@ -1122,6 +1127,19 @@ class DUWOClient:
             self.logged_in = False
             self.login()
 
+    BOOKING_CACHE_TTL = 45  # seconds; /status reads both views back to back
+
+    def _cached(self, key: str):
+        hit = self._cache.get(key)
+        if hit and time.time() - hit[0] < self.BOOKING_CACHE_TTL:
+            return hit[1]
+        return None
+
+    def _store(self, key: str, value):
+        if value is not None:
+            self._cache[key] = (time.time(), value)
+        return value
+
     def get_own_bookings(self) -> list[dict] | None:
         """Our own bookings, including windows the hour grid cannot render.
 
@@ -1130,6 +1148,9 @@ class DUWOClient:
         all of them, with the ResNr needed to cancel.
         """
         self._clear_error()
+        cached = self._cached("own_bookings")
+        if cached is not None:
+            return cached
         try:
             self._ensure_own_scope()
             if self._location_set:
@@ -1180,7 +1201,7 @@ class DUWOClient:
                     }
                 )
             bookings.sort(key=lambda b: b["start"])
-            return bookings
+            return self._store("own_bookings", bookings)
         except Exception as exc:
             self._set_error(f"Failed to load your bookings from DUWO: {exc}")
             return None
@@ -1199,6 +1220,9 @@ class DUWOClient:
         HTML comments; those are deliberately not parsed.
         """
         self._clear_error()
+        cached = self._cached("room_bookings")
+        if cached is not None:
+            return cached
         try:
             resp = self._get(f"{BASE_URL}/BookingOverview.php", init_location=True)
             table = BeautifulSoup(resp.text, "html.parser").find(id="BookingOverviewTable")
@@ -1239,7 +1263,7 @@ class DUWOClient:
                     }
                 )
             bookings.sort(key=lambda b: b["start"])
-            return bookings
+            return self._store("room_bookings", bookings)
         except Exception as exc:
             self._set_error(f"Could not load the laundry room schedule: {exc}")
             return None
@@ -1381,6 +1405,16 @@ Start and ready alerts are sent for your own machines only; nothing else is push
 )
 
 
+def _day_label(when: datetime, now: datetime) -> str:
+    """Compact, readable day for a booking row."""
+    delta = when.date() - now.date()
+    if delta.days == 0:
+        return "today   "
+    if delta.days == 1:
+        return "tomorrow"
+    return when.strftime("%d-%m   ")
+
+
 def handle_command(
     cmd: str, duwo: DUWOClient, bot: TelegramBot, tracker: CycleTracker
 ):
@@ -1399,38 +1433,57 @@ def handle_command(
         if not machines:
             bot.send(duwo.last_error or "Failed to get status. Try again.")
             return
-        header = f"{'Type':<12} {'Status':<12} {'Free':>4}"
-        sep = "-" * len(header)
+        stamp = datetime.now()
+        header = f"{'Type':<13}{'Free':>4}"
+        sep = "-" * 30
         rows = [header, sep]
         for m in machines:
-            short_type = m.machine_type[:12]
-            short_status = "Available" if m.available_count > 0 else "Occupied"
-            rows.append(f"{short_type:<12} {short_status:<12} {m.available_count:>4}")
+            rows.append(f"{m.machine_type[:13]:<13}{m.available_count:>4}")
         bal = duwo.get_balance()
         rows.append(sep)
         rows.append("Balance: unavailable" if bal is None else f"Balance: EUR {bal}")
 
-        # What the neighbours have reserved, so you know when you cannot walk up.
-        schedule = duwo.get_location_bookings()
-        if schedule:
-            stamp = datetime.now()
-            reserved = [
-                b
-                for b in schedule
-                if b["status"] == "BookingReady" and b["start"] >= stamp - timedelta(hours=1)
-            ]
-            rows.append(sep)
-            if reserved:
-                rows.append("Reserved in this room:")
-                for booking in reserved[:6]:
-                    when = booking["start"].strftime("%d-%m %H:%M")
-                    rows.append(
-                        f"  {booking['machine']:<7}{when}-{booking['end_label']}"
-                    )
-            else:
-                rows.append("Nothing reserved ahead.")
+        # Ours first. Read before the room view, which sets LocNR and so has to
+        # come second.
+        mine = duwo.get_own_bookings() or []
+        mine = [b for b in mine if b["status"] != "BookingFinished"]
+        rows.append("")
+        rows.append("YOURS")
+        if mine:
+            for b in mine:
+                state = {"BookingReady": "reserved", "BookingBusy": "running"}.get(
+                    b["status"], b["status"] or "?"
+                )
+                rows.append(
+                    f"  {b['machine']:<7}{_day_label(b['start'], stamp)} "
+                    f"{b['start']:%H:%M}-{b['end_label']}  {state}"
+                )
+        else:
+            rows.append("  nothing booked")
+
+        room = duwo.get_location_bookings() or []
+        owned = {(b["machine"], b["start"]) for b in mine}
+        others = [
+            b
+            for b in room
+            if b["status"] == "BookingReady"
+            and b["start"] >= stamp - timedelta(hours=1)
+            and (b["machine"], b["start"]) not in owned
+        ]
+        rows.append("")
+        rows.append("RESERVED BY OTHERS")
+        if others:
+            for b in others[:8]:
+                rows.append(
+                    f"  {b['machine']:<7}{_day_label(b['start'], stamp)} "
+                    f"{b['start']:%H:%M}-{b['end_label']}"
+                )
+        else:
+            rows.append("  nothing reserved ahead")
+
         bot.send(f"<pre>{html.escape(chr(10).join(rows))}</pre>")
         return
+
 
     # /slots (washers)
     if lower == "/slots":
@@ -1717,12 +1770,17 @@ def poll_cycles(duwo: DUWOClient, bot: TelegramBot, tracker: CycleTracker, suppr
             cycle_minutes = tracker.minutes_for(cycle.machine)
             cycle.notified_done = True
             changed = True
+            learns = cycle.machine in CycleTracker.CALIBRATED
+            if not learns:
+                # Nothing to calibrate for this machine, so close it out here
+                # rather than leave it sitting in /cycles waiting for a /done.
+                cycle.collected_at = stamp
             print(f"[CYCLE] {cycle.machine} {cycle.booking_nr} should be openable now")
             bot.send(
                 f"<b>{cycle.machine} ready</b>\n\n"
                 f"Started {cycle.started_at.strftime('%H:%M')}, "
-                f"{cycle_minutes:.0f} min ago.\n"
-                f"Send /done once you have actually opened it."
+                f"{cycle_minutes:.0f} min ago."
+                + ("\nSend /done once you have actually opened it." if learns else "")
             )
 
     tracker.prune(stamp)
