@@ -5,3 +5,6 @@ __pycache__/
 *.tar
 *.tar.gz
 CLAUDE.md
+data/*
+!data/.gitkeep
+.DS_Store

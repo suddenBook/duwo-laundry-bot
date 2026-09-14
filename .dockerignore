@@ -3,5 +3,8 @@
 __pycache__/
 *.pyc
 *.tar
+*.tar.gz
 .git/
 CLAUDE.md
+data/
+.DS_Store

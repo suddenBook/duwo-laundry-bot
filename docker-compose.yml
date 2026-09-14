@@ -1,7 +1,13 @@
 services:
   duwo-monitor:
     build: .
+    image: duwo-laundry-bot:latest
     container_name: duwo-laundry-bot
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      # Cycle timers live here so they survive a container restart.
+      STATE_PATH: /data/state.json
+    volumes:
+      - ./data:/data
