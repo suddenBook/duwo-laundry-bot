@@ -1206,9 +1206,18 @@ class DUWOClient:
                             int(window.group(2)),
                         ),
                         "end_label": f"{window.group(3)}:{window.group(4)}",
+                        "end": None,  # filled in below, once start is known
+                        "end": None,  # filled in below, once start is known
                         "status": status,
                     }
                 )
+            for b in bookings:
+                b["end"] = self._booking_end(
+                    b["start"], int(b["end_label"][:2]), int(b["end_label"][3:5])
+                )
+            # DUWO leaves old rows stuck at BookingBusy for ever; anything whose
+            # window closed well in the past is history, not a live booking.
+            bookings = [b for b in bookings if b["end"] >= now - timedelta(hours=2)]
             bookings.sort(key=lambda b: b["start"])
             return self._store("own_bookings", bookings)
         except Exception as exc:
@@ -1271,11 +1280,23 @@ class DUWOClient:
                         "status": status,
                     }
                 )
+            for b in bookings:
+                b["end"] = self._booking_end(
+                    b["start"], int(b["end_label"][:2]), int(b["end_label"][3:5])
+                )
+            bookings = [b for b in bookings if b["end"] >= now - timedelta(hours=2)]
             bookings.sort(key=lambda b: b["start"])
             return self._store("room_bookings", bookings)
         except Exception as exc:
             self._set_error(f"Could not load the laundry room schedule: {exc}")
             return None
+
+    @staticmethod
+    def _booking_end(start: datetime, hour: int, minute: int) -> datetime:
+        end = start.replace(hour=hour, minute=minute)
+        if end < start:
+            end += timedelta(days=1)
+        return end
 
     @staticmethod
     def _booking_datetime(now: datetime, month: int, day: int, hour: int, minute: int) -> datetime:
