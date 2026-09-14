@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """DUWO Laundry Monitor - Telegram bot that monitors and books laundry machines."""
 
+import html
 import io
 import json
 import os
@@ -1024,6 +1025,78 @@ class DUWOClient:
             self._set_error(f"cancel_booking failed: {e}")
             return False
 
+    def get_location_bookings(self) -> list[dict] | None:
+        """Upcoming reservations for the whole laundry room.
+
+        BookingOverview.php normally lists the logged-in account's own
+        bookings, but switches to the whole location once LocNR is set in the
+        PHP session -- which is what init_location does here.  That location
+        view is the room's shared schedule: it is how a resident sees which
+        machines are already spoken for.
+
+        Only what the page actually renders is read: date, time window and
+        machine type.  The page also leaks other residents' booking ids inside
+        HTML comments; those are deliberately not parsed.
+        """
+        self._clear_error()
+        try:
+            resp = self._get(f"{BASE_URL}/BookingOverview.php", init_location=True)
+            table = BeautifulSoup(resp.text, "html.parser").find(id="BookingOverviewTable")
+            if table is None:
+                self._set_error("Could not load the laundry room schedule.")
+                return None
+            now = datetime.now()
+            bookings = []
+            for row in table.find_all("tr"):
+                cells = [td.get_text(" ", strip=True) for td in row.find_all("td")]
+                if len(cells) < 4:
+                    continue
+                day = re.match(r"(\d{2})-(\d{2})$", cells[0])
+                window = re.match(r"(\d{2}):(\d{2})->(\d{2}):(\d{2})", cells[1])
+                if not day or not window:
+                    continue
+                status = next(
+                    (
+                        name
+                        for tag in row.find_all("p")
+                        for name in (tag.get("class") or [])
+                        if name.startswith("Booking")
+                    ),
+                    "",
+                )
+                bookings.append(
+                    {
+                        "start": self._booking_datetime(
+                            now,
+                            int(day.group(2)),
+                            int(day.group(1)),
+                            int(window.group(1)),
+                            int(window.group(2)),
+                        ),
+                        "end_label": f"{window.group(3)}:{window.group(4)}",
+                        "machine": "Washer" if "wash" in cells[3].lower() else "Dryer",
+                        "status": status,
+                    }
+                )
+            bookings.sort(key=lambda b: b["start"])
+            return bookings
+        except Exception as exc:
+            self._set_error(f"Could not load the laundry room schedule: {exc}")
+            return None
+
+    @staticmethod
+    def _booking_datetime(now: datetime, month: int, day: int, hour: int, minute: int) -> datetime:
+        """DUWO renders dates as DD-MM with no year; pick the nearest one."""
+        try:
+            stamp = datetime(now.year, month, day, hour, minute)
+        except ValueError:
+            return now
+        if stamp - now > timedelta(days=180):
+            return stamp.replace(year=now.year - 1)
+        if now - stamp > timedelta(days=180):
+            return stamp.replace(year=now.year + 1)
+        return stamp
+
     def get_recent_cycles(self) -> list[Cycle] | None:
         """Parse our own machine starts out of UserLog.php.
 
@@ -1140,10 +1213,7 @@ HELP_TEXT = """<b>DUWO Laundry Bot</b>
 /book 2
 /cancel 12345
 
-Start and ready alerts are sent for your own machines only; nothing else
-is pushed. DUWO frees a machine well before its door actually opens, so
-the bot runs its own clock: washer {washer} min, dryer {dryer} min.
-Send /done when you really open the door and it learns your timings.
+Start and ready alerts are sent for your own machines only; nothing else is pushed. DUWO frees a machine well before its door actually opens, so the bot runs its own clock: washer {washer} min, dryer {dryer} min. Send /done when you really open the door and it learns your timings.
 """.replace("{washer}", str(WASHER_CYCLE_MINUTES)).replace(
     "{dryer}", str(DRYER_CYCLE_MINUTES)
 )
@@ -1165,7 +1235,7 @@ def handle_command(
     if lower == "/status":
         machines = duwo.get_availability()
         if not machines:
-            bot.send("Failed to get status. Try again.")
+            bot.send(duwo.last_error or "Failed to get status. Try again.")
             return
         header = f"{'Type':<12} {'Status':<12} {'Free':>4}"
         sep = "-" * len(header)
@@ -1176,11 +1246,28 @@ def handle_command(
             rows.append(f"{short_type:<12} {short_status:<12} {m.available_count:>4}")
         bal = duwo.get_balance()
         rows.append(sep)
-        if bal is None:
-            rows.append("Balance: unavailable")
-        else:
-            rows.append(f"Balance: EUR {bal}")
-        bot.send(f"<pre>{chr(10).join(rows)}</pre>")
+        rows.append("Balance: unavailable" if bal is None else f"Balance: EUR {bal}")
+
+        # What the neighbours have reserved, so you know when you cannot walk up.
+        schedule = duwo.get_location_bookings()
+        if schedule:
+            stamp = datetime.now()
+            reserved = [
+                b
+                for b in schedule
+                if b["status"] == "BookingReady" and b["start"] >= stamp - timedelta(hours=1)
+            ]
+            rows.append(sep)
+            if reserved:
+                rows.append("Reserved in this room:")
+                for booking in reserved[:6]:
+                    when = booking["start"].strftime("%d-%m %H:%M")
+                    rows.append(
+                        f"  {booking['machine']:<7}{when}-{booking['end_label']}"
+                    )
+            else:
+                rows.append("Nothing reserved ahead.")
+        bot.send(f"<pre>{html.escape(chr(10).join(rows))}</pre>")
         return
 
     # /slots (washers)
