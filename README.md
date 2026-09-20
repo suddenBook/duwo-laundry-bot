@@ -54,12 +54,17 @@ Cycle tracking:
   so it is never adjusted by `/done`
 - `CYCLE_HEADSUP_MINUTES` (default `5`) — warning before ready, so you can walk down
 - `CYCLE_LOOKBACK_HOURS` (default `6`) — how far back to look for machine starts
-- `STATE_PATH` (default `/data/state.json`) — where timers and learned
-  durations are kept; must be on a volume to survive a restart
+- `STATE_PATH` (default `/data/state.json`) — where timers, learned
+  durations and the discovered room id are kept; must be on a volume to
+  survive a restart
 
 Other:
 
 - `CHECK_INTERVAL` (default `60`) — seconds between DUWO polls, minimum 30
+- `DUWO_LOCATION_ID` (default: auto-detect) — the laundry room id that booking
+  values start with. It is read off the booking calendar the first time one is
+  loaded and then kept in the state file, so this is only an escape hatch for
+  if DUWO stops printing it
 - `NOTIFY_AVAILABILITY` (default `false`) — push when free machines cross a threshold
 - `NOTIFY_LOW_BALANCE` (default `false`) — push when the balance is low
 - `LOW_BALANCE_THRESHOLD`, `WASHER_NOTIFY_THRESHOLD`, `DRYER_NOTIFY_THRESHOLD`

@@ -102,6 +102,11 @@ CYCLE_HEADSUP_MINUTES = _env_int("CYCLE_HEADSUP_MINUTES", 5)
 CYCLE_LOOKBACK_HOURS = _env_int("CYCLE_LOOKBACK_HOURS", 6)
 STATE_PATH = (os.environ.get("STATE_PATH") or "/data/state.json").strip()
 
+# The laundry room id that every booking value starts with (the 45 in
+# "45|2026-09-14|17:00:00|17:59").  Normally discovered from the calendar and
+# remembered, so this is only an escape hatch for when DUWO stops printing it.
+LOCATION_ID = (os.environ.get("DUWO_LOCATION_ID") or "").strip()
+
 WASHER_TYPE_ID = 93
 DRYER_TYPE_ID = 94
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
@@ -171,6 +176,10 @@ class CycleTracker:
             "Washer": float(WASHER_CYCLE_MINUTES),
             "Dryer": float(DRYER_CYCLE_MINUTES),
         }
+        # Not a cycle, but this is the one file we already persist: the room id
+        # is only ever printed on a *free* calendar slot, so a bot that starts
+        # up on a fully booked day could not otherwise find it at all.
+        self.location_id: str | None = None
         self.loaded = self._load()
 
     def _load(self) -> bool:
@@ -182,6 +191,9 @@ class CycleTracker:
         except (OSError, ValueError) as exc:
             print(f"[WARN] Could not read state file {self.path}: {exc}")
             return False
+        stored_location = str(data.get("location_id") or "").strip()
+        if stored_location:
+            self.location_id = stored_location
         for machine, value in (data.get("duration") or {}).items():
             if machine not in self.CALIBRATED:
                 # Not learned, so the configured value wins over whatever an
@@ -214,6 +226,7 @@ class CycleTracker:
     def save(self):
         payload = {
             "duration": self.duration,
+            "location_id": self.location_id,
             "cycles": [
                 {
                     "booking_nr": c.booking_nr,
@@ -237,6 +250,12 @@ class CycleTracker:
             os.replace(temp, self.path)
         except OSError as exc:
             print(f"[WARN] Could not write state file {self.path}: {exc}")
+
+    def remember_location_id(self, value: str):
+        """Record a newly discovered room id, persisting it immediately."""
+        if value and value != self.location_id:
+            self.location_id = value
+            self.save()
 
     def _clamp(self, minutes: float) -> float:
         return max(self.MIN_MINUTES, min(self.MAX_MINUTES, minutes))
@@ -444,7 +463,7 @@ class DUWOClient:
     LOGIN_COOLDOWN_MAX = 1800      # cap at 30 minutes
     LOGIN_COOLDOWN_MULTIPLIER = 2
 
-    def __init__(self, notify_callback=None):
+    def __init__(self, notify_callback=None, store=None):
         self.session = requests.Session()
         self.session.verify = False
         self.session.headers.update(
@@ -458,6 +477,7 @@ class DUWOClient:
         self.logged_in = False
         self.start_url = None
         self.last_known_balance = None
+        self.balance_stale = False          # is last_known_balance a fallback?
         self.last_error = None
         # Login rate-limiting state
         self._login_fail_count = 0
@@ -465,6 +485,8 @@ class DUWOClient:
         self._locked_until = 0.0            # timestamp: account lockout detected
         self._notify = notify_callback      # optional callable(str) for Telegram alerts
         self._location_set = False          # has LocNR been set in this session?
+        self._store = store                 # CycleTracker, for the room id
+        self._room_id = LOCATION_ID or (store.location_id if store else None)
         self._cache: dict[str, tuple[float, list]] = {}
 
     def _clear_error(self):
@@ -625,11 +647,9 @@ class DUWOClient:
             if not el:
                 continue
             text = el.get_text(" ", strip=True)
-            match = re.search(r"([0-9]+(?:[.,][0-9]{1,2})?)", text)
+            match = re.search(r"(-?[0-9]+(?:[.,][0-9]{1,2})?)", text)
             if match:
                 return match.group(1)
-            if text:
-                return text
 
         for line in soup.get_text("\n", strip=True).splitlines():
             lower = line.lower()
@@ -637,7 +657,7 @@ class DUWOClient:
                 continue
             if "balance" not in lower and "credit" not in lower:
                 continue
-            match = re.search(r"[€\u20ac]?\s*([0-9]+(?:[.,][0-9]{1,2})?)", line)
+            match = re.search(r"[€\u20ac]?\s*(-?[0-9]+(?:[.,][0-9]{1,2})?)", line)
             if match:
                 return match.group(1)
 
@@ -811,9 +831,14 @@ class DUWOClient:
                         price=price,
                     )
                 )
+            if slots:
+                self._remember_room_id(slots[0].location_id)
             return slots
-        except Exception:
-            self._set_error("get_booking_slots failed.")
+        except Exception as exc:
+            self._set_error(
+                f"Could not load "
+                f"{self._machine_type_name(machine_type_id).lower()} slots: {exc}"
+            )
             return None
 
     def book_slot(self, slot: BookingSlot, machine_type_id: int) -> bool:
@@ -910,44 +935,77 @@ class DUWOClient:
         return booked
 
     def get_balance(self) -> str | None:
-        """Get account balance via AnnouncmentBooking.php.
+        """Read the account balance off main.php.
 
-        The DUWO main page does not include balance in its HTML (it's AJAX-
-        loaded in the browser).  However, the booking confirmation page
-        (AnnouncmentBooking.php) always shows "Your Balance : € X.XX",
-        so we use that as a reliable source.  We request it with any valid
-        slot value — this only prepares a booking preview, it does NOT
-        actually create a booking.
+        main.php renders it server-side, so one plain GET is enough:
+
+            <div id='DivDispCredits'>Your balance is &#8364;
+              <span id='LblUserCredits'>5,00</span></div>
+
+        This used to go through AnnouncmentBooking.php, which is step 1 of the
+        booking flow and therefore needs a bookable slot to point at.  That
+        made the balance unreadable exactly when the room was fully booked or
+        the day was over -- nothing free to name, so nothing to ask about --
+        and it wrote pending-booking state into the PHP session on every
+        /status.  It survives only as a fallback if main.php ever stops
+        carrying the value.
+
+        Returns the balance, a stale one with `balance_stale` set if the read
+        failed but we have seen one before, or None.
         """
         self._clear_error()
+        balance = self._balance_from_main()
+        reason = self.last_error
+        if balance is None:
+            balance = self._balance_from_booking_page()
+        if balance is not None:
+            self._clear_error()
+            self.last_known_balance = balance
+            self.balance_stale = False
+            return balance
+        self.balance_stale = True
+        # The fallback runs through get_booking_slots, which clears last_error
+        # on the way in, so put back whatever main.php actually complained about.
+        self._set_error(reason or "Could not retrieve balance from DUWO.")
+        return self.last_known_balance
+
+    def _balance_from_main(self) -> str | None:
+        """The cheap, side-effect-free path: one GET of the landing page."""
         try:
-            # Get any available slot to use as a parameter
+            resp = self._get(f"{BASE_URL}/main.php")
+        except Exception as exc:
+            self._set_error(f"Could not reach DUWO for the balance: {exc}")
+            return None
+        balance = self._extract_balance(resp.text)
+        if balance is None:
+            self._set_error("main.php carried no balance.")
+        return balance
+
+    def _balance_from_booking_page(self) -> str | None:
+        """Fallback via the booking preview, which also prints the balance.
+
+        Needs a free slot to name, so it cannot help on a fully booked day --
+        it is only here in case main.php's markup changes.
+        """
+        try:
             slots = self.get_booking_slots(WASHER_TYPE_ID)
             if not slots:
                 slots = self.get_booking_slots(DRYER_TYPE_ID)
             if not slots:
-                self._set_error("No slots available to query balance.")
-                return self.last_known_balance
+                return None
             resp = self._get(
                 f"{BASE_URL}/AnnouncmentBooking.php?value={slots[0].raw_value}",
                 init_location=True,
             )
             m = re.search(
-                r"Your Balance\s*:.*?[€\u20ac&]?\s*([\d]+(?:[.,]\d{1,2})?)",
-                resp.text, re.DOTALL,
+                r"Your Balance\s*:[^\d]{0,20}?(-?[\d]+(?:[.,]\d{1,2})?)",
+                resp.text,
             )
             if m:
-                self.last_known_balance = m.group(1)
-                return self.last_known_balance
-            # Fallback: try extracting from HTML
-            balance = self._extract_balance(resp.text)
-            if balance:
-                self.last_known_balance = balance
-                return balance
+                return m.group(1)
+            return self._extract_balance(resp.text)
         except Exception:
-            pass
-        self._set_error("Could not retrieve balance from DUWO.")
-        return self.last_known_balance
+            return None
 
     def get_balance_float(self) -> float | None:
         bal = self.get_balance()
@@ -1092,10 +1150,25 @@ class DUWOClient:
         """
         self._clear_error()
         try:
-            location = self._location_id(machine_type_id)
+            location = self._location_id(machine_type_id, date)
             if location is None:
-                self._set_error("Could not work out the laundry room id.")
+                if not self.last_error:
+                    self._set_error("Could not work out the laundry room id.")
                 return None
+            # Load-bearing, not just a slot lookup: the booking value carries
+            # only room|date|start|end, with no machine type in it, so this
+            # request is what tells DUWO whether to reserve a washer or a
+            # dryer.  A day with nothing free still selects, but a page that
+            # fails to load does not -- and booking on from there would
+            # reserve whichever type happened to be selected last.
+            if self.get_booking_slots(machine_type_id, date=date) is None:
+                if not self.last_error:
+                    self._set_error(
+                        f"Could not select the "
+                        f"{self._machine_type_name(machine_type_id).lower()}."
+                    )
+                return None
+            self._clear_error()
             before = self._latest_booking_event()
             value = f"{location}|{date}|{start}:00|{end}"
             for step, url in (
@@ -1119,12 +1192,56 @@ class DUWOClient:
             self._set_error(f"Timed booking failed: {exc}")
             return None
 
-    def _location_id(self, machine_type_id: int) -> str | None:
-        """Read the room id off a real slot rather than hard-coding it."""
-        slots = self.get_booking_slots(machine_type_id)
-        if slots:
-            return slots[0].location_id
+    def _location_id(self, machine_type_id: int, date: str | None = None) -> str | None:
+        """The laundry room id a booking value starts with -- the 45 in
+        "45|2026-09-14|17:00:00|17:59".
+
+        DUWO prints it only on *free* calendar blocks, so a day with nothing
+        left to book carries it nowhere.  That is precisely when /book_at is
+        wanted -- late at night, or on a full room -- which is why reading it
+        off "today, whatever is free" used to fail seemingly at random.
+
+        It identifies the room, not the day or the machine, so once seen it is
+        remembered for good (in the state file, and overridable by
+        DUWO_LOCATION_ID).  Failing that, days more likely to still be empty
+        are tried before giving up.
+        """
+        if self._room_id:
+            return self._room_id
+        today = datetime.now().date()
+        days = [date] + [
+            (today + timedelta(days=offset)).strftime("%Y-%m-%d")
+            for offset in (0, 1, 2)
+        ]
+        # The id is room-wide, so the other machine type will do just as well.
+        types = [machine_type_id] + [
+            t for t in (WASHER_TYPE_ID, DRYER_TYPE_ID) if t != machine_type_id
+        ]
+        for type_id in types:
+            for day in dict.fromkeys(d for d in days if d):
+                slots = self.get_booking_slots(type_id, date=day)
+                if slots:
+                    return self._remember_room_id(slots[0].location_id)
+                if slots is None:
+                    # The calendar did not load at all -- a dead session or a
+                    # site error, not a full day.  Other days will fail the
+                    # same way, so stop and let the real error stand.
+                    return None
         return None
+
+    def _remember_room_id(self, value: str) -> str | None:
+        """Keep the first room id we see, and write it through to the state file."""
+        if LOCATION_ID:
+            # An explicit override outranks whatever the calendar says.
+            return LOCATION_ID
+        value = (value or "").strip()
+        if not value:
+            return None
+        if value != self._room_id:
+            self._room_id = value
+            if self._store is not None:
+                self._store.remember_location_id(value)
+        return value
 
     def _ensure_own_scope(self):
         """Drop LocNR so BookingOverview.php reports OUR bookings again.
@@ -1315,9 +1432,9 @@ class DUWOClient:
         """Parse our own machine starts out of UserLog.php.
 
         UserLog.php is always scoped to the logged-in account.  BookingOverview.php
-        is NOT: once LocNR is set in the PHP session (which login() does, via
-        findmachinetypes.php) it switches to listing the whole location's
-        bookings instead of ours, so it must not be used for this.
+        is NOT: once LocNR is set in the PHP session (which any init_location=True
+        call does, via findmachinetypes.php) it switches to listing the whole
+        location's bookings instead of ours, so it must not be used for this.
 
         A terminal start looks like:
 
@@ -1471,7 +1588,12 @@ def handle_command(
             rows.append(f"{m.machine_type[:13]:<13}{m.available_count:>4}")
         bal = duwo.get_balance()
         rows.append(sep)
-        rows.append("Balance: unavailable" if bal is None else f"Balance: EUR {bal}")
+        if bal is None:
+            rows.append("Balance: unavailable")
+        elif duwo.balance_stale:
+            rows.append(f"Balance: EUR {bal} (last known)")
+        else:
+            rows.append(f"Balance: EUR {bal}")
 
         # Ours first. Read before the room view, which sets LocNR and so has to
         # come second.
@@ -1560,6 +1682,11 @@ def handle_command(
         bal = duwo.get_balance()
         if bal is None:
             bot.send(duwo.last_error or "Failed to load balance from DUWO.")
+        elif duwo.balance_stale:
+            bot.send(
+                f"Balance: EUR {bal} (last known)\n"
+                f"{html.escape(duwo.last_error or 'DUWO did not answer just now.')}"
+            )
         else:
             bot.send(f"Balance: EUR {bal}")
         return
@@ -1831,7 +1958,8 @@ def run():
     print("=" * 50)
 
     bot = TelegramBot()
-    duwo = DUWOClient(notify_callback=bot.send)
+    tracker = CycleTracker(STATE_PATH)
+    duwo = DUWOClient(notify_callback=bot.send, store=tracker)
 
     # Retry initial login with backoff — don't exit on lockout
     while not duwo.login():
@@ -1850,7 +1978,6 @@ def run():
     bot.flush_old_updates()
     bot.set_commands()
 
-    tracker = CycleTracker(STATE_PATH)
     first_cycle_poll = not tracker.loaded
     if first_cycle_poll:
         print("[INFO] No state file yet: existing log entries will not be announced.")
@@ -1934,7 +2061,7 @@ def run():
             if NOTIFY_LOW_BALANCE and now - last_balance_check >= 600:
                 last_balance_check = now
                 bal = duwo.get_balance_float()
-                if bal is not None:
+                if bal is not None and not duwo.balance_stale:
                     if bal < LOW_BALANCE_THRESHOLD and not low_balance_notified:
                         bot.send(
                             f"<b>Low balance: EUR {bal:.2f}</b>\n\n"
