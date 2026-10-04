@@ -1,8 +1,8 @@
 # DUWO Laundry Bot
 
-Telegram bot for the DUWO laundry system: tells you when your own machine is
-*actually* ready, and answers questions about machines, slots and bookings on
-demand.
+Telegram bot for the DUWO laundry system: estimates when your own machine is
+ready, and answers questions about availability, slots, bookings and balance on
+demand. Readiness is a timer estimate, not a door sensor reading.
 
 ## Why it exists
 
@@ -22,19 +22,26 @@ its own clock, which `/done` calibrates against reality over time.
 
 ## Features
 
-- Messages you when one of your machines starts, a few minutes before it is
-  ready, and when it is really ready to open
+- Messages you when one of your machines starts, a few minutes before its
+  estimated finish, and when the estimated cycle time has elapsed
 - Learns your real cycle length from `/done` feedback (EWMA, persisted to disk)
 - Timers survive a container restart
-- **Quiet by default** — nothing else is ever pushed; ask with `/status`
+- **Quiet by default** — availability and low-balance alerts are opt-in;
+  connection problems can still trigger an alert
 - Reserves **any** time window, not just the whole hours DUWO's calendar
   offers: `/book_at washer 23:17 23:57`
 - `/status` shows free machines, your balance, your own bookings, and what
   the rest of the room has reserved ahead — all in one message
 - `/status`, `/cycles`, `/done`, `/slots`, `/slots_dryer`, `/book`,
   `/book_dryer`, `/book_at`, `/bookings`, `/cancel`, `/balance`, `/qr`
-- Verifies booking and cancellation results instead of trusting a single
-  response page
+- Verifies booking and cancellation against fresh personal reservations,
+  including the machine type and full time window
+- Keeps personal and room schedules separate, and reports unavailable data
+  instead of claiming there are no bookings
+- Continues saved cycle timers during a DUWO outage, retries failed notifications,
+  and persists Telegram command offsets to prevent replay after a restart
+- `/book N` finds a single window with enough capacity for all N machines;
+  partial success is reported explicitly
 
 ## Environment
 
@@ -96,25 +103,61 @@ STATE_PATH=./data/state.json uv run python duwo_monitor.py
 
 ## Notes
 
-- `/done` closes out every machine started within 15 minutes of the most recent
-  one, which is how loads are actually run — two or three back to back. It
+- `/done` closes out washers started within 15 minutes of the most recent
+  washer, which is how loads are actually run — two or three back to back. It
   calibrates from the *last* machine to start, since that is the one that
   decides when the batch can be emptied. Only the washer is learned; the dryer
   really does take its advertised 40 minutes, so a finished dryer closes itself
   out and never asks for `/done`.
 - `/book_at` books a window DUWO's own UI cannot express. `CreateBooking.php`
-  accepts it but then returns HTTP 500 while trying to draw the result into an
+  can accept it and then return HTTP 500 while trying to draw the result into an
   hour grid — *after* committing — so the status code is ignored and the
-  booking is confirmed against `UserLog.php` instead. Such a booking is
-  invisible on the hour calendar; `/bookings` reads `BookingOverview.php`
-  so it can still list and cancel it.
-- On first run there is no state file, so machines already in the DUWO log are
-  recorded silently rather than firing a burst of stale notifications.
-- `/balance` depends on what the DUWO site renders for the account. If DUWO
-  hides the balance block, the bot reports that balance is unavailable.
+  booking is confirmed against the personal `BookingOverview.php` instead.
+  Timeouts are verified the same way, without repeating the creation request.
+  Such a booking can be invisible on the hour calendar; `/bookings` can still
+  list it. `/book_at` returns the cancellation ID; `/cancel` also accepts the
+  separate BookingNR from the activity log for compatibility.
+- On first run, past notifications are suppressed. Machines still running
+  retain their upcoming reminders. State migration preserves existing timers
+  and learned durations.
+- `/balance` explicitly selects `main.php?page=user.php`. DUWO sometimes renders
+  the previous page once, so the account page is checked with at most two reads.
+  Missing balance data is marked unavailable or last-known; recharge history
+  and booking previews are never mistaken for the current balance.
 - `/qr` deliberately generates a new QR code each time, so a code someone
   photographed over your shoulder stops working.
 - Machine-start detection reads `UserLog.php`, which is always scoped to the
   logged-in account. `BookingOverview.php` is *not*: once `LocNR` is set in the
   PHP session it lists the whole location's bookings instead, so it must not be
-  used for this.
+  used for this. Personal booking reads restore account scope before parsing
+  any cancellation IDs. The shared overview only shows the rows DUWO exposes;
+  it is not a guarantee that no other reservations exist.
+- Reservation changes require a verified preview. A session expiry during the
+  prepared operation aborts it; the bot never resumes a half-prepared change
+  in a fresh session. If the final outcome cannot be verified, check `/bookings`
+  before retrying.
+- Telegram command offsets are saved before executing each command. A process
+  interruption can leave that command unanswered; it will not be automatically
+  executed again. Pending later commands remain queued.
+- Network errors on the NAS can still delay fresh website data. Saved timers
+  continue, and the status output distinguishes DUWO's free count from your
+  estimated physical completion time.
+
+## Tests and dependency updates
+
+The regression suite uses a simulated stateful DUWO session and mocked Telegram
+responses; it never creates real reservations or sends Telegram messages.
+
+```bash
+uv sync --locked
+uv run python -m unittest discover -s tests -v
+```
+
+The Docker build runs the same suite and installs the versions and hashes in
+`requirements.txt`, exported from `uv.lock`. After changing dependencies:
+
+```bash
+uv lock
+uv export --format requirements-txt --no-dev --no-emit-project -o requirements.txt
+docker compose build
+```
