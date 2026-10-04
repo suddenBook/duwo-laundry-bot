@@ -90,6 +90,18 @@ class Commands(unittest.TestCase):
         )
         self.assertIsNone(client.get_availability()[0].available_count)
 
+    def test_bookings_labels_stale_duwo_timer_without_offering_cancel(self):
+        site = Website()
+        site.mine = [
+            booking(start=datetime.now() - timedelta(minutes=65), status="BookingBusy")
+        ]
+        bot = Mock()
+        app.handle_command("/bookings", site.client(), bot, Mock())
+        message = bot.send.call_args.args[0]
+        self.assertIn("DUWO timer ended", message)
+        self.assertNotIn("running", message)
+        self.assertNotIn("/cancel", message)
+
     def test_past_reservations_are_not_listed_as_active(self):
         site = Website()
         site.mine = [booking(start=datetime.now() - timedelta(hours=3))]

@@ -1511,6 +1511,14 @@ def _day_label(when: datetime, now: datetime) -> str:
     return when.strftime("%d-%m   ")
 
 
+def _reservation_state(booking: dict, now: datetime) -> str:
+    if booking["status"] == "BookingBusy":
+        return "DUWO timer ended" if booking["end"] < now else "running (DUWO)"
+    return {"BookingReady": "reserved", "BookingFinished": "finished"}.get(
+        booking["status"], "unknown"
+    )
+
+
 def handle_command(cmd: str, duwo: DUWOClient, bot: TelegramBot, tracker: CycleTracker):
     """Process a Telegram command and reply."""
     cmd = cmd.strip()
@@ -1560,12 +1568,7 @@ def handle_command(cmd: str, duwo: DUWOClient, bot: TelegramBot, tracker: CycleT
             rows.append("  nothing booked")
         else:
             for booking in mine:
-                state = {
-                    "BookingReady": "reserved",
-                    "BookingBusy": "running (DUWO)",
-                }.get(booking["status"], "unknown")
-                if booking["status"] == "BookingBusy" and booking["end"] < stamp:
-                    state = "DUWO timer ended"
+                state = _reservation_state(booking, stamp)
                 rows.append(
                     f"  {booking['machine']} {_day_label(booking['start'], stamp)} "
                     f"{booking['start']:%H:%M}-{booking['end_label']} {state}"
@@ -1695,17 +1698,20 @@ def handle_command(cmd: str, duwo: DUWOClient, bot: TelegramBot, tracker: CycleT
             bot.send("No active bookings.")
             return
         lines = ["<b>Your bookings:</b>", ""]
+        stamp = datetime.now()
         for b in upcoming:
-            state = {"BookingReady": "reserved", "BookingBusy": "running"}.get(
-                b["status"], b["status"] or "?"
-            )
+            state = _reservation_state(b, stamp)
             when = b["start"].strftime("%d-%m %H:%M")
-            lines.append(
-                f"  {b['machine']} | {when}-{b['end_label']} | {state}"
+            cancel_id = (
                 f" | ID: <code>{html.escape(b['id'])}</code>"
+                if b["status"] == "BookingReady"
+                else ""
             )
-        lines.append("")
-        lines.append("Cancel: /cancel ID")
+            lines.append(
+                f"  {b['machine']} | {when}-{b['end_label']} | {state}{cancel_id}"
+            )
+        if any(b["status"] == "BookingReady" for b in upcoming):
+            lines.extend(["", "Cancel an unused reservation: /cancel ID"])
         bot.send("\n".join(lines))
         return
 
