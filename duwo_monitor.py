@@ -1522,7 +1522,7 @@ def _reservation_state(booking: dict, now: datetime) -> str:
 def handle_command(cmd: str, duwo: DUWOClient, bot: TelegramBot, tracker: CycleTracker):
     """Process a Telegram command and reply."""
     cmd = cmd.strip()
-    lower = re.sub(r"^(/[a-z_]+)@[a-z0-9_]+(?=\s|$)", r"\1", cmd.lower())
+    lower = cmd.lower()
 
     # /help or /start
     if lower in ("/help", "/start"):

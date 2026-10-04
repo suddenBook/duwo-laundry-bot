@@ -51,13 +51,12 @@ class Commands(unittest.TestCase):
             app.handle_command("/status", client, bot, tracker)
         self.assertIn("YOUR CYCLE ESTIMATES", bot.send.call_args.args[0])
 
-    def test_named_bot_command_works(self):
+    def test_commands_addressed_to_another_bot_do_not_book(self):
         client = Mock()
-        client.get_balance.return_value = "0.00"
-        client.balance_stale = False
-        bot = Mock()
-        app.handle_command("/balance@LaundryBot", client, bot, Mock())
-        self.assertEqual(bot.send.call_args.args[0], "Balance: EUR 0.00")
+        client.book_multiple.return_value = []
+        client.last_error = None
+        app.handle_command("/book@OtherBot 1", client, Mock(), Mock())
+        client.book_multiple.assert_not_called()
 
     def test_untrusted_error_is_escaped(self):
         client = Mock()
