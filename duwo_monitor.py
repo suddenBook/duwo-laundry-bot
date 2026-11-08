@@ -683,6 +683,7 @@ class DUWOClient:
         # Set while the main loop polls on its own, rather than for a command.
         self.background = False
         self._yield_until = 0.0  # background logins wait until this timestamp
+        self._last_ok = 0.0  # when an authenticated page last loaded
         # A block notice from DUWO pauses every request until it lifts.
         self._blocked_until = 0.0
         self._block_message = ""
@@ -936,7 +937,9 @@ class DUWOClient:
             resp = self._fetch(url)
         except PermissionError:
             self.logged_in = False
-            if self.background:
+            # A session that worked a moment ago was ended by a login
+            # elsewhere; one idle through a block or an outage just expired.
+            if self.background and time.time() - self._last_ok <= 3 * CHECK_INTERVAL:
                 self._yield_session()
             if not allow_retry:
                 raise RuntimeError(
@@ -965,6 +968,7 @@ class DUWOClient:
         self._block_lifted()
         if self._is_auth_redirect(resp):
             raise PermissionError("DUWO session expired")
+        self._last_ok = time.time()
         return resp
 
     @staticmethod
@@ -1057,6 +1061,7 @@ class DUWOClient:
                 # selected pass init_location=True.
                 self._location_set = False
                 self.logged_in = True
+                self._last_ok = time.time()
                 self._block_lifted()
                 self._on_login_success()
                 print("[OK] Login successful")

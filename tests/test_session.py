@@ -22,6 +22,7 @@ class SessionSharing(unittest.TestCase):
         self.client.login = Mock(side_effect=login)
 
     def test_background_check_leaves_the_session_to_a_login_elsewhere(self):
+        self.client.get_own_bookings()
         self.site.expire_at = "UserLog.php"
         with self.client.in_background():
             self.assertIsNone(self.client.get_recent_cycles())
@@ -31,6 +32,7 @@ class SessionSharing(unittest.TestCase):
         self.assertIn("signed in elsewhere", self.client.last_error)
 
     def test_a_command_signs_back_in_at_once(self):
+        self.client.get_own_bookings()
         self.site.expire_at = "UserLog.php"
         with self.client.in_background():
             self.client.get_recent_cycles()
@@ -39,6 +41,7 @@ class SessionSharing(unittest.TestCase):
         self.assertEqual(self.logins, 1)
 
     def test_background_checks_resume_after_the_pause(self):
+        self.client.get_own_bookings()
         self.site.expire_at = "UserLog.php"
         with self.client.in_background():
             self.client.get_recent_cycles()
@@ -48,7 +51,16 @@ class SessionSharing(unittest.TestCase):
             self.assertEqual(self.client.get_recent_cycles(), [])
         self.assertEqual(self.logins, 1)
 
+    def test_a_session_that_expired_while_idle_is_renewed_at_once(self):
+        self.client._last_ok = time.time() - 5 * 3600  # e.g. through a block
+        self.site.expire_at = "UserLog.php"
+        with self.client.in_background():
+            self.client.get_recent_cycles()
+        self.assertEqual(self.logins, 1)
+        self.assertEqual(self.client._yield_until, 0.0)
+
     def test_pause_can_be_switched_off(self):
+        self.client.get_own_bookings()
         self.site.expire_at = "UserLog.php"
         original = app.SESSION_YIELD_MINUTES
         app.SESSION_YIELD_MINUTES = 0
