@@ -64,6 +64,7 @@ Cycle tracking:
 Other:
 
 - `CHECK_INTERVAL` (default `60`) — seconds between DUWO polls, minimum 30
+- `SESSION_YIELD_MINUTES` (default `15`) — DUWO keeps one login session per account, so signing in on your phone ends the bot's session and the bot signing back in ends yours. After losing its session the bot leaves the account to you this long before its background checks sign in again; commands you send still sign in at once. `0` signs straight back in
 - `DUWO_LOCATION_ID` (default: auto-detect) — the laundry room id that booking
   values start with. It is read off the booking calendar the first time one is
   loaded and then kept in the state file, so this is only an escape hatch for

@@ -11,6 +11,7 @@ import os
 import re
 import time
 import traceback
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -113,6 +114,10 @@ DRYER_CYCLE_MINUTES = max(15, min(150, _env_int("DRYER_CYCLE_MINUTES", 40)))
 CYCLE_HEADSUP_MINUTES = max(0, _env_int("CYCLE_HEADSUP_MINUTES", 5))
 CYCLE_LOOKBACK_HOURS = max(3, _env_int("CYCLE_LOOKBACK_HOURS", 6))
 STATE_PATH = (os.environ.get("STATE_PATH") or "/data/state.json").strip()
+# DUWO keeps one session per account: logging in on the phone ends the bot's
+# session and the bot's next login ends the phone's. After losing its session
+# the bot leaves it to the owner this long before background checks log in.
+SESSION_YIELD_MINUTES = max(0, _env_int("SESSION_YIELD_MINUTES", 15))
 
 # The laundry room id that every booking value starts with (the 45 in
 # "45|2026-09-14|17:00:00|17:59").  Normally discovered from the calendar and
@@ -142,6 +147,10 @@ class DuwoUnavailable(RuntimeError):
 
 class DuwoBlocked(DuwoUnavailable):
     """DUWO refuses this connection or this account for a while."""
+
+
+class DuwoPaused(DuwoUnavailable):
+    """Background checks leave the DUWO session to the owner for a while."""
 
 
 # ============== Data ==============
@@ -609,6 +618,9 @@ class DUWOClient:
         self._login_fail_count = 0
         self._login_alerted = False
         self._login_cooldown_until = 0.0  # timestamp: don't attempt login before this
+        # Set while the main loop polls on its own, rather than for a command.
+        self.background = False
+        self._yield_until = 0.0  # background logins wait until this timestamp
         # A block notice from DUWO pauses every request until it lifts.
         self._blocked_until = 0.0
         self._block_message = ""
@@ -622,6 +634,30 @@ class DUWOClient:
 
     def _clear_error(self):
         self.last_error = None
+
+    @contextmanager
+    def in_background(self):
+        """Mark requests made by the main loop rather than by a command."""
+        self.background = True
+        try:
+            yield
+        finally:
+            self.background = False
+
+    def _yield_session(self):
+        """Leave the account to the owner after DUWO ended our session.
+
+        DUWO keeps one session per account, so the usual reason is a login on
+        the owner's phone; logging straight back in would sign them out.
+        """
+        if SESSION_YIELD_MINUTES <= 0:
+            return
+        self._yield_until = time.time() + SESSION_YIELD_MINUTES * 60
+        resume = datetime.fromtimestamp(self._yield_until)
+        print(
+            "[INFO] DUWO ended the session, most likely a login elsewhere; "
+            f"background checks resume at {resume:%H:%M}"
+        )
 
     def _set_error(self, message: str):
         self.last_error = message
@@ -832,6 +868,8 @@ class DUWOClient:
             resp = self._fetch(url)
         except PermissionError:
             self.logged_in = False
+            if self.background:
+                self._yield_session()
             if not allow_retry:
                 raise RuntimeError(
                     "DUWO session expired; the operation was not retried."
@@ -965,7 +1003,14 @@ class DUWOClient:
 
     def ensure_login(self):
         self._raise_if_blocked()
-        if not self.logged_in and not self.login():
+        if self.logged_in:
+            return
+        if self.background and time.time() < self._yield_until:
+            resume = datetime.fromtimestamp(self._yield_until)
+            raise DuwoPaused(
+                f"DUWO is signed in elsewhere; background checks resume at {resume:%H:%M}."
+            )
+        if not self.login():
             self._raise_if_blocked()
             raise RuntimeError(
                 "DUWO login unavailable; retry after the login cooldown."
@@ -2302,74 +2347,77 @@ def run():
 
             now = time.time()
 
-            # 2. Track our own machines -- this is the job that matters
-            if now - last_cycle_check >= CHECK_INTERVAL:
-                last_cycle_check = now
-                poll_cycles(duwo, bot, tracker, suppress=not tracker.cycle_baseline_set)
+            # Checks the bot makes on its own leave the DUWO session to the
+            # owner for a while after a login elsewhere ended it.
+            with duwo.in_background():
+                # 2. Track our own machines -- this is the job that matters
+                if now - last_cycle_check >= CHECK_INTERVAL:
+                    last_cycle_check = now
+                    poll_cycles(duwo, bot, tracker, suppress=not tracker.cycle_baseline_set)
 
-            # 3. Availability alerts, off unless NOTIFY_AVAILABILITY is set
-            if NOTIFY_AVAILABILITY and now - last_check >= CHECK_INTERVAL:
-                last_check = now
-                ts = datetime.now().strftime("%H:%M:%S")
-                machines = duwo.get_availability()
+                # 3. Availability alerts, off unless NOTIFY_AVAILABILITY is set
+                if NOTIFY_AVAILABILITY and now - last_check >= CHECK_INTERVAL:
+                    last_check = now
+                    ts = datetime.now().strftime("%H:%M:%S")
+                    machines = duwo.get_availability()
 
-                if not machines:
-                    print(f"[{ts}] Failed to get status")
-                    last_check = now - CHECK_INTERVAL + 15
-                    continue
+                    if not machines:
+                        print(f"[{ts}] Failed to get status")
+                        last_check = now - CHECK_INTERVAL + 15
+                        continue
 
-                washer = next(
-                    (m for m in machines if "wash" in m.machine_type.lower()), None
-                )
-                dryer = next(
-                    (m for m in machines if "dry" in m.machine_type.lower()), None
-                )
-                w = washer.available_count if washer else None
-                d = dryer.available_count if dryer else None
+                    washer = next(
+                        (m for m in machines if "wash" in m.machine_type.lower()), None
+                    )
+                    dryer = next(
+                        (m for m in machines if "dry" in m.machine_type.lower()), None
+                    )
+                    w = washer.available_count if washer else None
+                    d = dryer.available_count if dryer else None
 
-                print(f"[{ts}] Washer: {w} | Dryer: {d}")
+                    print(f"[{ts}] Washer: {w} | Dryer: {d}")
 
-                # Notify on current machine status thresholds
-                if last_washer is not None and w is not None:
-                    if last_washer < WASHER_NOTIFY_THRESHOLD <= w:
-                        bot.send(
-                            f"<b>Washers available now</b>\n\n"
-                            f"Current free washers: {w}\n"
-                            f"Alert threshold: {WASHER_NOTIFY_THRESHOLD}\n\n"
-                            f"Use /status to check current machine status."
-                        )
-                    elif last_washer > 0 and w == 0:
-                        bot.send("All washers now occupied.")
+                    # Notify on current machine status thresholds
+                    if last_washer is not None and w is not None:
+                        if last_washer < WASHER_NOTIFY_THRESHOLD <= w:
+                            bot.send(
+                                f"<b>Washers available now</b>\n\n"
+                                f"Current free washers: {w}\n"
+                                f"Alert threshold: {WASHER_NOTIFY_THRESHOLD}\n\n"
+                                f"Use /status to check current machine status."
+                            )
+                        elif last_washer > 0 and w == 0:
+                            bot.send("All washers now occupied.")
 
-                if last_dryer is not None and d is not None:
-                    if last_dryer < DRYER_NOTIFY_THRESHOLD <= d:
-                        bot.send(
-                            f"<b>Dryers available now</b>\n\n"
-                            f"Current free dryers: {d}\n"
-                            f"Alert threshold: {DRYER_NOTIFY_THRESHOLD}\n\n"
-                            f"Use /status to check current machine status."
-                        )
-                    elif last_dryer > 0 and d == 0:
-                        bot.send("All dryers now occupied.")
+                    if last_dryer is not None and d is not None:
+                        if last_dryer < DRYER_NOTIFY_THRESHOLD <= d:
+                            bot.send(
+                                f"<b>Dryers available now</b>\n\n"
+                                f"Current free dryers: {d}\n"
+                                f"Alert threshold: {DRYER_NOTIFY_THRESHOLD}\n\n"
+                                f"Use /status to check current machine status."
+                            )
+                        elif last_dryer > 0 and d == 0:
+                            bot.send("All dryers now occupied.")
 
-                last_washer = w
-                last_dryer = d
+                    last_washer = w
+                    last_dryer = d
 
-            # 4. Low-balance alert, off unless NOTIFY_LOW_BALANCE is set
-            if NOTIFY_LOW_BALANCE and now - last_balance_check >= 600:
-                last_balance_check = now
-                bal = duwo.get_balance_float()
-                if bal is not None and not duwo.balance_stale:
-                    if bal < LOW_BALANCE_THRESHOLD and not low_balance_notified:
-                        delivered = bot.send(
-                            f"<b>Low balance: EUR {bal:.2f}</b>\n\n"
-                            f"Top up on the DUWO website (Add Credits → Upgrade online, min EUR 20)."
-                        )
-                        low_balance_notified = delivered
-                    elif bal >= LOW_BALANCE_THRESHOLD:
-                        low_balance_notified = False
-                elif duwo.last_error:
-                    print("[INFO] Skipping balance alert")
+                # 4. Low-balance alert, off unless NOTIFY_LOW_BALANCE is set
+                if NOTIFY_LOW_BALANCE and now - last_balance_check >= 600:
+                    last_balance_check = now
+                    bal = duwo.get_balance_float()
+                    if bal is not None and not duwo.balance_stale:
+                        if bal < LOW_BALANCE_THRESHOLD and not low_balance_notified:
+                            delivered = bot.send(
+                                f"<b>Low balance: EUR {bal:.2f}</b>\n\n"
+                                f"Top up on the DUWO website (Add Credits → Upgrade online, min EUR 20)."
+                            )
+                            low_balance_notified = delivered
+                        elif bal >= LOW_BALANCE_THRESHOLD:
+                            low_balance_notified = False
+                    elif duwo.last_error:
+                        print("[INFO] Skipping balance alert")
 
         except KeyboardInterrupt:
             bot.send("DUWO Laundry Bot stopped.")
