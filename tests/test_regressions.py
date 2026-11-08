@@ -33,11 +33,6 @@ class ReportedRegressions(unittest.TestCase):
             client._get = Mock(return_value=response(overview()))
             self.assertIsNotNone(client.get_own_bookings())
 
-    def test_room_bookings_can_be_loaded_without_state_store(self):
-        client = app.DUWOClient()
-        client._get = Mock(return_value=response(overview()))
-        self.assertIsNotNone(client.get_location_bookings())
-
     def test_status_does_not_report_failed_read_as_empty_schedule(self):
         client = Mock()
         client.get_availability.return_value = [
@@ -46,7 +41,7 @@ class ReportedRegressions(unittest.TestCase):
         client.get_balance.return_value = "5.00"
         client.balance_stale = False
         client.get_own_bookings.return_value = None
-        client.get_location_bookings.return_value = None
+        client.get_room_calendar.return_value = None
         bot = Mock()
         tracker = Mock()
         tracker.pending.return_value = []

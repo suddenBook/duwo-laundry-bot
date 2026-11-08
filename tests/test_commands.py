@@ -11,19 +11,24 @@ from test_flows import Website, booking
 
 
 class Commands(unittest.TestCase):
-    def test_status_keeps_other_reservations_in_same_window(self):
+    def test_status_shows_how_full_the_coming_hours_are(self):
         site = Website()
         site.mine = [booking()]
+        start = site.slot
+        site.calendar_blocks = lambda: [(start - timedelta(hours=1), "full"), (start, 1)]
         client = site.client()
         client.get_availability = Mock(
-            return_value=[app.MachineStatus("ROOM", "Washer", "Available: 2", 2)]
+            return_value=[app.MachineStatus("ROOM", "Washer", "2 available", 2)]
         )
         with tempfile.TemporaryDirectory() as tmp:
             tracker = app.CycleTracker(tmp + "/state.json")
             bot = Mock()
             app.handle_command("/status", client, bot, tracker)
-        text = bot.send.call_args.args[0]
-        self.assertIn("Washer tomorrow", text.split("RESERVED BY OTHERS")[1])
+        text = bot.send.call_args.args[0].split("ROOM CALENDAR")[1]
+        hour = start - timedelta(hours=1)
+        label = f"{hour:%H:%M}" if hour.date() == datetime.now().date() else f"tmrw {hour:%H:%M}"
+        self.assertIn(f"{label:<12}full    full", text)
+        self.assertIn("Washer  Dryer", text)
 
     def test_account_page_switch_can_take_one_extra_read(self):
         client = app.DUWOClient()
@@ -125,7 +130,7 @@ class Commands(unittest.TestCase):
         client = app.DUWOClient()
         with self.assertRaises(ValueError):
             client._parse_bookings(
-                '<div id="BookingOverviewTable"><tr><td>bad</td></tr></div>', own=True
+                '<div id="BookingOverviewTable"><tr><td>bad</td></tr></div>'
             )
 
     def test_done_does_not_close_an_unfinished_dryer(self):

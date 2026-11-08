@@ -30,14 +30,12 @@ its own clock, which `/done` calibrates against reality over time.
   connection problems can still trigger an alert
 - Reserves **any** time window, not just the whole hours DUWO's calendar
   offers: `/book_at washer 23:17 23:57`
-- `/status` shows free machines, your balance, your own bookings, and what
-  the rest of the room has reserved ahead — all in one message
+- `/status` shows free machines, your balance, your own bookings, and how full the booking calendar is for the coming hours — all in one message
 - `/status`, `/cycles`, `/done`, `/slots`, `/slots_dryer`, `/book`,
   `/book_dryer`, `/book_at`, `/bookings`, `/cancel`, `/balance`, `/qr`
 - Verifies booking and cancellation against fresh personal reservations,
   including the machine type and full time window
-- Keeps personal and room schedules separate, and reports unavailable data
-  instead of claiming there are no bookings
+- Reports unavailable data instead of claiming there are no bookings
 - Continues saved cycle timers during a DUWO outage, retries failed notifications,
   and persists Telegram command offsets to prevent replay after a restart
 - `/book N` finds a single window with enough capacity for all N machines;
@@ -124,11 +122,7 @@ STATE_PATH=./data/state.json uv run python duwo_monitor.py
 - `/qr` deliberately generates a new QR code each time, so a code someone
   photographed over your shoulder stops working.
 - Machine-start detection reads `UserLog.php`, the account's activity log, which lists entries per day to the minute. A start is matched to its machine by the payment row carrying the exact booking number (EUR 2.00 washer, EUR 1.00 dryer), or else by the machine named on the debit just before it. If the log's layout cannot be read, the bot says so once rather than mistaking it for a quiet laundry room.
-- `BookingOverview.php` is *not* always scoped to the account: once `LocNR` is set in the
-  PHP session it lists the whole location's bookings instead, so it must not be
-  used for this. Personal booking reads restore account scope before parsing
-  any cancellation IDs. The shared overview only shows the rows DUWO exposes;
-  it is not a guarantee that no other reservations exist.
+- DUWO shows each resident only their own bookings, so `BookingOverview.php` is the account's own list whichever room the session has selected. The room's schedule in `/status` therefore comes from the booking calendar: for each coming hour, how many bookable places are left (only about half of the machines can be booked), `full`, or `yours`.
 - Reservation changes require a verified preview. A session expiry during the
   prepared operation aborts it; the bot never resumes a half-prepared change
   in a fresh session. If the final outcome cannot be verified, check `/bookings`

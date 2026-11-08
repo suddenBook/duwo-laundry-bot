@@ -4,7 +4,6 @@
 import html
 import io
 import math
-from collections import Counter
 from decimal import Decimal, InvalidOperation
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
 import json
@@ -165,6 +164,17 @@ class BookingSlot:
     end_time: str
     available_count: int
     price: str
+
+
+@dataclass
+class CalendarBlock:
+    """One hour of DUWO's booking calendar for one machine type."""
+
+    start: datetime
+    end: datetime
+    free: int  # bookable places left
+    yours: bool = False  # this account holds a booking in it
+    slot: BookingSlot | None = None  # the booking value, while places are left
 
 
 @dataclass
@@ -1018,65 +1028,102 @@ class DUWOClient:
             self._set_error(f"Could not load machine availability: {exc}")
             return []
 
-    def get_booking_slots(
+    def get_calendar(
         self, machine_type_id: int, date: str | None = None
-    ) -> list[BookingSlot] | None:
+    ) -> list[CalendarBlock] | None:
+        """One day of the booking calendar for a machine type (default today)."""
         self._clear_error()
+        day = date or datetime.now().strftime("%Y-%m-%d")
         try:
-            url = f"{BASE_URL}/FindAvailableFromMachineType.php?ObjectMachineTypeID={machine_type_id}"
-            if date:
-                url += f"&Start_Date={date}"
-            resp = self._get(url, init_location=True)
-            soup = BeautifulSoup(resp.text, "html.parser")
-            header = soup.find("div", id="CalendarObjectKopTekst")
-            blocks = soup.find_all("div", class_="DivCalendarObjectTijdsBlokNotBooked")
-            if header is None and not blocks:
-                self._set_error(
-                    f"Failed to load {self._machine_type_name(machine_type_id).lower()} slots from DUWO."
-                )
-                return None
-            slots = []
-            for block in blocks:
-                name = block.get("name", "")
-                parts = name.split("|")
-                if len(parts) != 4:
-                    continue
-                text = block.get_text()
-                avail = 0
-                m = re.search(r"Available for booking:\s*(\d+)", text)
-                if m:
-                    avail = int(m.group(1))
-                price = ""
-                pm = re.search(r"Pay on delivery\s*:\s*[€\u20ac]?\s*([\d.,]+)", text)
-                if pm:
-                    price = pm.group(1)
-                slots.append(
-                    BookingSlot(
-                        raw_value=name,
-                        location_id=parts[0],
-                        date=parts[1],
-                        start_time=parts[2],
-                        end_time=parts[3],
-                        available_count=avail,
-                        price=price,
-                    )
-                )
-            if slots:
-                self._remember_room_id(slots[0].location_id)
-            slots = [
-                slot
-                for slot in slots
-                if slot.available_count > 0
-                and datetime.fromisoformat(f"{slot.date}T{slot.end_time}")
-                >= datetime.now()
-            ]
-            return sorted(slots, key=lambda slot: (slot.date, slot.start_time))
+            query = urlencode({"ObjectMachineTypeID": machine_type_id, "Start_Date": day})
+            resp = self._get(
+                f"{BASE_URL}/FindAvailableFromMachineType.php?{query}",
+                init_location=True,
+            )
+            blocks = self._parse_calendar(resp.text, day)
         except Exception as exc:
             self._set_error(
                 f"Could not load "
                 f"{self._machine_type_name(machine_type_id).lower()} slots: {exc}"
             )
             return None
+        slots = [block.slot for block in blocks if block.slot]
+        if slots:
+            self._remember_room_id(slots[0].location_id)
+        return blocks
+
+    @staticmethod
+    def _parse_calendar(markup: str, day: str) -> list[CalendarBlock]:
+        """The hour blocks of FindAvailableFromMachineType.php.
+
+        A block with places left carries its booking value as its name
+        ("45|2026-11-08|19:00:00|19:59") and "Available for booking:N"; a
+        full block only shows its hours, as BookedNotByYou, or as BookedByYou
+        when this account holds a booking in it.
+        """
+        soup = BeautifulSoup(markup, "html.parser")
+        if soup.find(id="CalendarObjectKopTekst") is None:
+            raise ValueError("DUWO did not return the booking calendar.")
+        date = datetime.strptime(day, "%Y-%m-%d")
+        blocks = []
+        for div in soup.find_all("div"):
+            classes = div.get("class") or []
+            free = "DivCalendarObjectTijdsBlokNotBooked" in classes
+            if not free and not {"BookedNotByYou", "BookedByYou"} & set(classes):
+                continue
+            text = div.get_text(" ")
+            if not free:
+                hours = re.search(r"(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})", text)
+                if not hours:
+                    raise ValueError("A calendar block has no recognisable hours.")
+                begin = date.replace(hour=int(hours.group(1)), minute=int(hours.group(2)))
+                finish = DUWOClient._booking_end(
+                    begin, int(hours.group(3)), int(hours.group(4))
+                )
+                blocks.append(
+                    CalendarBlock(begin, finish, 0, yours="BookedByYou" in classes)
+                )
+                continue
+            parts = div.get("name", "").split("|")
+            count = re.search(r"Available for booking\s*:\s*(\d+)", text)
+            window = (
+                re.fullmatch(r"(\d{2}):(\d{2})(?::\d{2})?", parts[2])
+                and re.fullmatch(r"(\d{2}):(\d{2})", parts[3])
+                if len(parts) == 4
+                else None
+            )
+            if not count or not window:
+                raise ValueError("A free calendar block has no booking value or count.")
+            begin = datetime.strptime(f"{parts[1]} {parts[2][:5]}", "%Y-%m-%d %H:%M")
+            finish = DUWOClient._booking_end(
+                begin, int(parts[3][:2]), int(parts[3][3:5])
+            )
+            price = re.search(r"Pay on delivery\s*:\s*[€\u20ac]?\s*([\d.,]+)", text)
+            slot = BookingSlot(
+                raw_value=div["name"],
+                location_id=parts[0],
+                date=parts[1],
+                start_time=parts[2],
+                end_time=parts[3],
+                available_count=int(count.group(1)),
+                price=price.group(1) if price else "",
+            )
+            blocks.append(CalendarBlock(begin, finish, slot.available_count, slot=slot))
+        return sorted(blocks, key=lambda block: block.start)
+
+    def get_booking_slots(
+        self, machine_type_id: int, date: str | None = None
+    ) -> list[BookingSlot] | None:
+        """Bookable slots of one day that have not ended yet."""
+        blocks = self.get_calendar(machine_type_id, date)
+        if blocks is None:
+            return None
+        now = datetime.now()
+        return [
+            block.slot
+            for block in blocks
+            if block.slot and block.free > 0 and block.end >= now
+        ]
 
     MAX_BOOKINGS = 10
 
@@ -1351,11 +1398,9 @@ class DUWOClient:
                 self._state_store.remember_location_id(value)
         return value
 
-    def _ensure_own_scope(self):
-        if self._location_set:
-            self._account_home()
-
-    def _parse_bookings(self, markup: str, *, own: bool) -> list[dict]:
+    def _parse_bookings(self, markup: str) -> list[dict]:
+        """This account's rows of BookingOverview.php, which DUWO limits to the
+        logged-in account whichever room the session has selected."""
         soup = BeautifulSoup(markup, "html.parser")
         table = soup.find(id="BookingTable") or soup.find(id="BookingOverviewTable")
         if table is None:
@@ -1419,20 +1464,16 @@ class DUWOClient:
                 end_label=end.strftime("%H:%M"),
                 status=status,
             )
-            if own:
-                # Only parse the hidden identifiers after restoring account scope.
-                markup_row = str(row)
-                res = re.search(r"RemoveBooking\(\s*['\"]?(\d+)['\"]?\s*\)", markup_row)
-                if not res:
-                    raise ValueError(
-                        "An account booking has no cancellation identifier."
-                    )
-                entry["id"] = res.group(1)
-                number = re.search(
-                    r"RemoveBooking\([^)]*\)[^>]*>\s*<p[^>]*>\s*(\d+)\s*</p>",
-                    markup_row,
-                )
-                entry["booking_nr"] = number.group(1) if number else ""
+            markup_row = str(row)
+            res = re.search(r"RemoveBooking\(\s*['\"]?(\d+)['\"]?\s*\)", markup_row)
+            if not res:
+                raise ValueError("A booking has no cancellation identifier.")
+            entry["id"] = res.group(1)
+            number = re.search(
+                r"RemoveBooking\([^)]*\)[^>]*>\s*<p[^>]*>\s*(\d+)\s*</p>",
+                markup_row,
+            )
+            entry["booking_nr"] = number.group(1) if number else ""
             bookings.append(entry)
         return sorted(bookings, key=lambda b: b["start"])
 
@@ -1448,9 +1489,8 @@ class DUWOClient:
     def get_own_bookings(self, *, include_inactive: bool = False) -> list[dict] | None:
         self._clear_error()
         try:
-            self._ensure_own_scope()
             resp = self._get(f"{BASE_URL}/BookingOverview.php")
-            bookings = self._parse_bookings(resp.text, own=True)
+            bookings = self._parse_bookings(resp.text)
             if include_inactive:
                 return bookings
             now = datetime.now()
@@ -1467,14 +1507,24 @@ class DUWOClient:
             self._set_error(f"Could not load your bookings: {exc}")
             return None
 
-    def get_location_bookings(self) -> list[dict] | None:
-        self._clear_error()
-        try:
-            resp = self._get(f"{BASE_URL}/BookingOverview.php", init_location=True)
-            return self._parse_bookings(resp.text, own=False)
-        except Exception as exc:
-            self._set_error(f"Could not load the room schedule: {exc}")
+    def get_room_calendar(self, machine_type_id: int, hours: int = 6):
+        """The next hour blocks of the booking calendar, into tomorrow if needed.
+
+        DUWO shows no other resident's booking, so how full the coming hours
+        are is the closest thing to the room's schedule.
+        """
+        now = datetime.now()
+        blocks = self.get_calendar(machine_type_id)
+        if blocks is None:
             return None
+        upcoming = [block for block in blocks if block.end >= now]
+        if len(upcoming) < hours:
+            tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+            more = self.get_calendar(machine_type_id, tomorrow)
+            if more is None:
+                return None
+            upcoming += more
+        return upcoming[:hours]
 
     @staticmethod
     def _booking_end(start: datetime, hour: int, minute: int) -> datetime:
@@ -1698,6 +1748,25 @@ def _day_label(when: datetime, now: datetime) -> str:
     return when.strftime("%d-%m   ")
 
 
+def _calendar_rows(washers, dryers, now: datetime) -> list[str]:
+    """Places left per coming hour for washers and dryers, side by side."""
+    if washers is None and dryers is None:
+        return ["  unavailable (DUWO read failed)"]
+    hours: dict[datetime, list[str]] = {}
+    for column, blocks in enumerate((washers, dryers)):
+        for block in blocks or []:
+            state = "yours" if block.yours else str(block.free) if block.free else "full"
+            hours.setdefault(block.start, ["?", "?"])[column] = state
+    if not hours:
+        return ["  no more slots in the calendar"]
+    lines = [f"  {'Hour':<12}{'Washer':<8}Dryer"]
+    for start in sorted(hours)[:6]:
+        label = f"{start:%H:%M}" if start.date() == now.date() else f"tmrw {start:%H:%M}"
+        washer, dryer = hours[start]
+        lines.append(f"  {label:<12}{washer:<8}{dryer}")
+    return lines
+
+
 def _reservation_state(booking: dict, now: datetime) -> str:
     if booking["status"] == "BookingBusy":
         return "DUWO timer ended" if booking["end"] < now else "running (DUWO)"
@@ -1773,42 +1842,14 @@ def handle_command(cmd: str, duwo: DUWOClient, bot: TelegramBot, tracker: CycleT
                 )
                 rows.append(f"  {cycle.machine} {cycle.started_at:%H:%M}: {state}")
 
-        room = duwo.get_location_bookings()
+        rows.extend(["", "ROOM CALENDAR (bookable places left)"])
         rows.extend(
-            [
-                "",
-                "RESERVED BY OTHERS (DUWO overview)"
-                if mine is not None
-                else "ROOM RESERVATIONS (may include yours)",
-            ]
-        )
-        if room is None:
-            rows.append("  unavailable (DUWO read failed)")
-        else:
-            # Subtract individual reservations, not all machines at the same time.
-            owned = Counter(
-                (b["machine"], b["start"], b["end"])
-                for b in mine or []
-                if b["status"] == "BookingReady"
+            _calendar_rows(
+                duwo.get_room_calendar(WASHER_TYPE_ID),
+                duwo.get_room_calendar(DRYER_TYPE_ID),
+                stamp,
             )
-            others = []
-            for booking in room:
-                if booking["status"] != "BookingReady" or booking["end"] < stamp:
-                    continue
-                key = (booking["machine"], booking["start"], booking["end"])
-                if owned[key]:
-                    owned[key] -= 1
-                else:
-                    others.append(booking)
-            for booking in others[:8]:
-                rows.append(
-                    f"  {booking['machine']} {_day_label(booking['start'], stamp)} "
-                    f"{booking['start']:%H:%M}-{booking['end_label']}"
-                )
-            if len(others) > 8:
-                rows.append(f"  ... {len(others) - 8} more")
-            if not others:
-                rows.append("  no upcoming reservations shown")
+        )
         bot.send(f"<pre>{html.escape(chr(10).join(rows))}</pre>")
         return
 

@@ -49,6 +49,27 @@ def booking_html(rows):
     return body + "</table></div></div>"
 
 
+def calendar_html(blocks):
+    """FindAvailableFromMachineType.php for (start, places | "full" | "yours")."""
+    body = "<div id='CalendarObject'><div id='CalendarObjectKopTekst'><span class='KopMachine'>Washing machines</span></div><div id='SelectBlocks'>"
+    for start, state in sorted(blocks, key=lambda block: block[0]):
+        hours = f"{start:%H:%M} - {start:%H}:59"
+        if isinstance(state, int):
+            body += (
+                f"<div topay='0' name='45|{start:%Y-%m-%d}|{start:%H:%M}:00|{start:%H}:59' "
+                f"id='CalendarObjectTijdsBlokNotBooked' class='DivCalendarObjectTijdsBlokNotBooked .BtnSelect'>"
+                f"<span class='TijdsBlokTijd'>{hours}</span><span class='TijdsBlokVrij'>Available for booking:{state} </span>"
+                f"<span class='TijdsBlokDeliveryPrice'>Pay on delivery : &euro; 2.00</span></div>"
+            )
+        else:
+            css = "BookedByYou" if state == "yours" else "BookedNotByYou"
+            body += (
+                f"<div id='CalendarObjectTijdsBlokBooked' class='{css}' rel='ObjID45'>"
+                f"<span class='TijdsBlokTijd'>{hours}</span><span class='TijdsBlokNaam'>Not Available for booking</span></div>"
+            )
+    return body + "</div></div>"
+
+
 def userlog_html(entries):
     """DUWO's UserLog.php for (time, action, detail, amount) entries, oldest first."""
     body = (
@@ -87,6 +108,12 @@ class Website:
         self.malformed_overview = False
         self.slot = booking()["start"]
         self.raw = f"45|{self.slot:%Y-%m-%d}|12:00:00|12:59"
+        self.taken = []  # starts of hours booked by others
+
+    def calendar_blocks(self):
+        blocks = [(start, "full") for start in self.taken]
+        blocks.append((self.slot, 2))
+        return blocks
 
     def get(self, url, **kwargs):
         path = urlparse(url).path.rsplit("/", 1)[-1]
@@ -108,15 +135,11 @@ class Website:
         if path == "BookingOverview.php":
             if self.malformed_overview:
                 return response("<h1>Error</h1>", 500)
-            return response(
-                booking_html(
-                    self.mine if self.scope == "own" else self.mine + self.room
-                )
-            )
+            # DUWO lists only the account's own bookings, whatever the scope.
+            return response(booking_html(self.mine))
         if path == "FindAvailableFromMachineType.php":
             self.machine = int(query["ObjectMachineTypeID"][0])
-            return response(f"""<div id='CalendarObjectKopTekst'>{self.slot:%d-%m-%Y}</div>
-            <div class='DivCalendarObjectTijdsBlokNotBooked' name='{self.raw}'>Available for booking: 2 Pay on delivery: € 2.00</div>""")
+            return response(calendar_html(self.calendar_blocks()))
         if path == "AnnouncmentBooking.php":
             if "ResNr" in query:
                 self.removing = query["ResNr"][0]
@@ -161,15 +184,15 @@ class Website:
 
 
 class BookingFlows(unittest.TestCase):
-    def test_own_room_own_preserves_scope_without_new_login(self):
+    def test_own_bookings_need_no_page_switch_after_the_calendar(self):
         site = Website()
         site.mine = [booking()]
         client = site.client()
         client.login = Mock(side_effect=AssertionError("Unexpected login"))
+        client.get_booking_slots(app.WASHER_TYPE_ID)
+        calls = len(site.calls)
         self.assertEqual([b["id"] for b in client.get_own_bookings()], ["100"])
-        self.assertEqual(len(client.get_location_bookings()), 2)
-        self.assertEqual([b["id"] for b in client.get_own_bookings()], ["100"])
-        self.assertEqual(site.scope, "own")
+        self.assertEqual(site.calls[calls:], ["BookingOverview.php"])
 
     def test_reads_are_fresh(self):
         site = Website()
@@ -233,14 +256,13 @@ class BookingFlows(unittest.TestCase):
         )
         self.assertNotIn("CreateBooking.php", site.calls)
 
-    def test_cancel_own_booking_after_room_read(self):
+    def test_cancel_own_booking_after_calendar_read(self):
         site = Website()
         site.mine = [booking()]
         client = site.client()
-        client.get_location_bookings()
+        client.get_booking_slots(app.DRYER_TYPE_ID)
         self.assertTrue(client.cancel_booking("100"), client.last_error)
         self.assertEqual(site.mine, [])
-        self.assertEqual(len(site.room), 1)
 
     def test_cancel_accepts_activity_log_booking_number(self):
         site = Website()
@@ -333,14 +355,37 @@ class BookingFlows(unittest.TestCase):
         self.assertFalse(client.cancel_booking("100"))
         self.assertNotIn("DeleteBooking.php", site.calls)
 
-    def test_room_page_never_exposes_cancellation_identifiers(self):
+    def test_calendar_reports_full_and_own_hours(self):
+        site = Website()
+        start = site.slot
+        site.taken = [start - timedelta(hours=2)]
+        site.calendar_blocks = lambda: [
+            (start - timedelta(hours=2), "full"),
+            (start - timedelta(hours=1), "yours"),
+            (start, 1),
+        ]
+        blocks = site.client().get_calendar(93, f"{start:%Y-%m-%d}")
+        self.assertEqual(
+            [(b.start, b.free, b.yours, b.slot is not None) for b in blocks],
+            [
+                (start - timedelta(hours=2), 0, False, False),
+                (start - timedelta(hours=1), 0, True, False),
+                (start, 1, False, True),
+            ],
+        )
+
+    def test_unreadable_free_block_is_an_error_not_an_empty_day(self):
         site = Website()
         client = site.client()
-        rows = client.get_location_bookings()
-        self.assertTrue(rows)
-        self.assertTrue(
-            all("id" not in row and "booking_nr" not in row for row in rows)
+        client._location_set = True
+        client.session.get = Mock(
+            return_value=response(
+                "<div id='CalendarObjectKopTekst'></div>"
+                "<div class='DivCalendarObjectTijdsBlokNotBooked' name='45|x'>Available for booking : 2</div>"
+            )
         )
+        self.assertIsNone(client.get_booking_slots(93))
+        self.assertIn("booking value", client.last_error)
 
     def test_invalid_counts_and_past_dates_make_no_requests(self):
         site = Website()
