@@ -63,6 +63,33 @@ class Commands(unittest.TestCase):
         app.handle_command("/book@OtherBot 1", client, Mock(), Mock())
         client.book_multiple.assert_not_called()
 
+    def test_bare_book_only_explains_usage(self):
+        for command in ["/book", "/book_dryer"]:
+            with self.subTest(command=command):
+                client = Mock()
+                bot = Mock()
+                app.handle_command(command, client, bot, Mock())
+                client.book_multiple.assert_not_called()
+                self.assertIn("Usage", bot.send.call_args.args[0])
+
+    def test_book_at_refuses_a_window_that_is_already_running(self):
+        client = Mock()
+        bot = Mock()
+
+        class Frozen(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 11, 9, 14, 30)
+
+        with patch.object(app, "datetime", Frozen):
+            app.handle_command("/book_at washer 14:00 14:45", client, bot, Mock())
+            client.create_timed_booking.assert_not_called()
+            self.assertIn("already started", bot.send.call_args.args[0])
+            app.handle_command("/book_at washer 13:00 13:45", client, bot, Mock())
+        self.assertEqual(
+            client.create_timed_booking.call_args.args, (93, "2026-11-10", "13:00", "13:45")
+        )
+
     def test_untrusted_error_is_escaped(self):
         client = Mock()
         client.get_balance.return_value = None

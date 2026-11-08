@@ -1126,19 +1126,51 @@ class DUWOClient:
         ]
 
     MAX_BOOKINGS = 10
+    # A booking must be started within 15 minutes of its start, so a longer
+    # window only keeps a place from the neighbours; a typo should not.
+    MAX_WINDOW = timedelta(hours=2)
+    MAX_AHEAD = timedelta(days=14)
+    START_GRACE = timedelta(minutes=15)
 
-    def _validate_window(self, machine_type_id: int, date: str, start: str, end: str):
+    def _validate_window(
+        self,
+        machine_type_id: int,
+        date: str,
+        start: str,
+        end: str,
+        *,
+        allow_started: bool = False,
+    ):
+        """Check a window before anything is sent; return its start and end.
+
+        allow_started accepts a calendar hour DUWO still offers after it began.
+        """
         if machine_type_id not in (WASHER_TYPE_ID, DRYER_TYPE_ID):
             raise ValueError("Unknown machine type.")
         begin = datetime.strptime(f"{date} {start[:5]}", "%Y-%m-%d %H:%M")
         finish = datetime.strptime(f"{date} {end[:5]}", "%Y-%m-%d %H:%M")
-        if begin < datetime.now().replace(second=0, microsecond=0):
-            raise ValueError("The booking start is in the past.")
+        now = datetime.now().replace(second=0, microsecond=0)
         if finish <= begin:
             raise ValueError(
                 "The end time must be after the start time on the same day."
             )
+        if finish <= now:
+            raise ValueError("That window has already ended.")
+        if begin < now and not allow_started:
+            raise ValueError("The booking start is in the past.")
+        if finish - begin > self.MAX_WINDOW:
+            raise ValueError("A booking can last at most 2 hours.")
+        if begin > now + self.MAX_AHEAD:
+            raise ValueError("A booking can start at most 14 days ahead.")
         return begin, finish
+
+    @staticmethod
+    def _page_message(markup: str) -> str:
+        """The visible text of a short DUWO reply, for an error message."""
+        soup = BeautifulSoup(markup, "html.parser")
+        for tag in soup(["script", "style"]):
+            tag.decompose()
+        return " ".join(soup.get_text(" ").split())[:200]
 
     @staticmethod
     def _script_value(markup: str, name: str) -> str | None:
@@ -1147,12 +1179,18 @@ class DUWOClient:
         )
         return match.group(1) if match else None
 
-    def _create_booking(self, slot: BookingSlot, machine_type_id: int) -> str | None:
+    def _create_booking(
+        self, slot: BookingSlot, machine_type_id: int, *, allow_started: bool = False
+    ) -> str | None:
         self._clear_error()
         submitted = False
         try:
             start, end = self._validate_window(
-                machine_type_id, slot.date, slot.start_time, slot.end_time
+                machine_type_id,
+                slot.date,
+                slot.start_time,
+                slot.end_time,
+                allow_started=allow_started,
             )
             before = self.get_own_bookings(include_inactive=True)
             if before is None:
@@ -1161,10 +1199,17 @@ class DUWOClient:
                 )
             known = {b["id"] for b in before}
             # This request selects the machine type in PHP. Nothing that changes
-            # account/room scope may run between here and the final submission.
-            if self.get_booking_slots(machine_type_id, date=slot.date) is None:
+            # the selection may run between here and the final submission.
+            blocks = self.get_calendar(machine_type_id, slot.date)
+            if blocks is None:
                 raise RuntimeError(
                     self.last_error or "Could not select the machine type."
+                )
+            rooms = {block.slot.location_id for block in blocks if block.slot}
+            if rooms and slot.location_id not in rooms:
+                raise RuntimeError(
+                    f"The calendar now belongs to room {min(rooms)}, not "
+                    f"{slot.location_id}; nothing was booked. Try again."
                 )
             query = urlencode({"value": slot.raw_value})
             announce = self._get(
@@ -1188,7 +1233,11 @@ class DUWOClient:
                 or self._script_value(confirm.text, "ObjectMachineTypeID")
                 != str(machine_type_id)
             ):
-                raise RuntimeError("DUWO rejected the booking confirmation.")
+                reason = self._page_message(confirm.text)
+                raise RuntimeError(
+                    "DUWO rejected the booking"
+                    + (f": {reason}" if reason else ".")
+                )
             submitted = True
             self.balance_stale = True
             try:
@@ -1227,19 +1276,35 @@ class DUWOClient:
             return None
 
     def book_slot(self, slot: BookingSlot, machine_type_id: int) -> bool:
-        return self._create_booking(slot, machine_type_id) is not None
+        """Book a slot DUWO's calendar offers, even one whose hour has begun."""
+        return (
+            self._create_booking(slot, machine_type_id, allow_started=True) is not None
+        )
+
+    def get_upcoming_slots(self, machine_type_id: int) -> list[BookingSlot] | None:
+        """Bookable slots for the rest of today and for tomorrow."""
+        slots = []
+        for offset in (0, 1):
+            day = (datetime.now() + timedelta(days=offset)).strftime("%Y-%m-%d")
+            found = self.get_booking_slots(machine_type_id, day)
+            if found is None:
+                return None
+            slots += found
+        return slots
 
     def book_multiple(self, machine_type_id: int, count: int) -> list[BookingSlot]:
         self._clear_error()
         if not 1 <= count <= self.MAX_BOOKINGS:
             self._set_error(f"Choose between 1 and {self.MAX_BOOKINGS} machines.")
             return []
-        slots = self.get_booking_slots(machine_type_id)
+        slots = self.get_upcoming_slots(machine_type_id)
         if slots is None:
             return []
         slot = next((s for s in slots if s.available_count >= count), None)
         if slot is None:
-            self._set_error(f"No single time window has {count} machines available.")
+            self._set_error(
+                f"No single time window today or tomorrow has {count} places left."
+            )
             return []
         booked = []
         for _ in range(count):
@@ -1535,15 +1600,17 @@ class DUWOClient:
     def _booking_datetime(
         now: datetime, month: int, day: int, hour: int, minute: int
     ) -> datetime:
-        candidates = []
-        for year in (now.year - 1, now.year, now.year + 1):
+        """A year-less overview date: the latest one not beyond the booking
+        horizon, so a row from last spring stays in the past."""
+        horizon = now + timedelta(days=60)
+        for year in range(now.year + 1, now.year - 5, -1):
             try:
-                candidates.append(datetime(year, month, day, hour, minute))
+                stamp = datetime(year, month, day, hour, minute)
             except ValueError:
                 continue
-        if not candidates:
-            raise ValueError("Invalid booking date.")
-        return min(candidates, key=lambda stamp: abs(stamp - now))
+            if stamp <= horizon:
+                return stamp
+        raise ValueError("Invalid booking date.")
 
     LOG_MONTHS = {
         "jan": 1, "feb": 2, "mar": 3, "mrt": 3, "apr": 4, "may": 5, "mei": 5,
@@ -1853,47 +1920,28 @@ def handle_command(cmd: str, duwo: DUWOClient, bot: TelegramBot, tracker: CycleT
         bot.send(f"<pre>{html.escape(chr(10).join(rows))}</pre>")
         return
 
-    # /slots (washers)
-    if lower == "/slots":
-        slots = duwo.get_booking_slots(WASHER_TYPE_ID)
+    # /slots and /slots_dryer
+    if lower in ("/slots", "/slots_dryer"):
+        kind = "dryer" if lower == "/slots_dryer" else "washer"
+        slots = duwo.get_upcoming_slots(
+            DRYER_TYPE_ID if kind == "dryer" else WASHER_TYPE_ID
+        )
         if slots is None:
             bot.send(
-                html.escape(duwo.last_error or "Failed to load washer slots from DUWO.")
+                html.escape(duwo.last_error or f"Failed to load {kind} slots from DUWO.")
             )
             return
         if not slots:
-            bot.send("No washer slots available.")
+            bot.send(f"No {kind} slots left today or tomorrow.")
             return
-        lines = ["<b>Washer slots:</b>", ""]
+        lines = [f"<b>{kind.capitalize()} slots:</b>", ""]
         for s in slots:
             lines.append(
                 f"{s.date} {s.start_time[:5]}-{s.end_time} "
                 f"| free: {s.available_count} | €{html.escape(s.price)}"
             )
-        lines.append("")
-        lines.append("Reply /book N to book N washers for the earliest slot.")
-        bot.send("\n".join(lines))
-        return
-
-    # /slots_dryer
-    if lower == "/slots_dryer":
-        slots = duwo.get_booking_slots(DRYER_TYPE_ID)
-        if slots is None:
-            bot.send(
-                html.escape(duwo.last_error or "Failed to load dryer slots from DUWO.")
-            )
-            return
-        if not slots:
-            bot.send("No dryer slots available.")
-            return
-        lines = ["<b>Dryer slots:</b>", ""]
-        for s in slots:
-            lines.append(
-                f"{s.date} {s.start_time[:5]}-{s.end_time} "
-                f"| free: {s.available_count} | €{html.escape(s.price)}"
-            )
-        lines.append("")
-        lines.append("Reply /book_dryer N to book N dryers for the earliest slot.")
+        command = "/book_dryer" if kind == "dryer" else "/book"
+        lines += ["", f"Reply {command} N to book N {kind}s for the earliest slot."]
         bot.send("\n".join(lines))
         return
 
@@ -1977,7 +2025,10 @@ def handle_command(cmd: str, duwo: DUWOClient, bot: TelegramBot, tracker: CycleT
         except ValueError:
             bot.send("Times must look like HH:MM, e.g. /book_at washer 23:17 23:57")
             return
-        now = datetime.now()
+        if end_t <= start_t:
+            bot.send("The end time must be after the start time on the same day.")
+            return
+        now = datetime.now().replace(second=0, microsecond=0)
         if date_raw:
             try:
                 day = datetime.strptime(date_raw, "%Y-%m-%d").date()
@@ -1985,12 +2036,17 @@ def handle_command(cmd: str, duwo: DUWOClient, bot: TelegramBot, tracker: CycleT
                 bot.send("Date must look like YYYY-MM-DD.")
                 return
         else:
+            # A window that is over today means tomorrow; one still running
+            # today is a mistake to point out, not to move to another day.
             day = now.date()
-            if datetime.combine(day, start_t) < now.replace(second=0, microsecond=0):
+            if datetime.combine(day, end_t) <= now:
                 day = day + timedelta(days=1)
-        if datetime.combine(day, end_t) <= datetime.combine(day, start_t):
-            bot.send("The end time must be after the start time.")
-            return
+            elif datetime.combine(day, start_t) < now:
+                bot.send(
+                    "That window has already started today. Choose a start from "
+                    "now on, or add a date for another day."
+                )
+                return
 
         type_id = WASHER_TYPE_ID if kind == "washer" else DRYER_TYPE_ID
         start_s = start_t.strftime("%H:%M")
@@ -1999,8 +2055,10 @@ def handle_command(cmd: str, duwo: DUWOClient, bot: TelegramBot, tracker: CycleT
         bot.send(f"Reserving {kind} {date_s} {start_s}-{end_s}...")
         booking_nr = duwo.create_timed_booking(type_id, date_s, start_s, end_s)
         if booking_nr:
+            start_by = datetime.combine(day, start_t) + DUWOClient.START_GRACE
             bot.send(
                 f"[OK] Reserved {kind} {date_s} {start_s}-{end_s}\n"
+                f"Start the machine by {start_by:%H:%M} or the booking expires.\n"
                 f"Cancel ID: <code>{html.escape(booking_nr)}</code>\n"
                 f"Use /bookings to view it, or /cancel {html.escape(booking_nr)}."
             )
@@ -2016,17 +2074,17 @@ def handle_command(cmd: str, duwo: DUWOClient, bot: TelegramBot, tracker: CycleT
             "Usage: /book_at washer|dryer HH:MM HH:MM [YYYY-MM-DD]\n"
             "Examples: /book_at washer 23:17 23:57\n"
             "          /book_at dryer 19:30 20:10 2026-09-16\n\n"
-            "Books any window, not just whole hours. "
-            "Defaults to today, or tomorrow if that time has passed."
+            "Books any window of up to 2 hours, not just whole hours. "
+            "Defaults to today, or tomorrow if that window is already over."
         )
         return
 
     # /book N and /book_dryer N reserve one shared time window.
-    match = re.fullmatch(
-        r"/book(?P<kind>_washer|_dryer)?(?:\s+(?P<count>[0-9]{1,3}))?", lower
-    )
+    # The number is required: Telegram turns a bare /book in any message into a
+    # link, and one tap must not reserve a machine.
+    match = re.fullmatch(r"/book(?P<kind>_washer|_dryer)?\s+(?P<count>[0-9]{1,3})", lower)
     if match:
-        count = int(match.group("count") or "1")
+        count = int(match.group("count"))
         kind = "dryer" if match.group("kind") == "_dryer" else "washer"
         type_id = DRYER_TYPE_ID if kind == "dryer" else WASHER_TYPE_ID
         if not 1 <= count <= DUWOClient.MAX_BOOKINGS:
@@ -2038,7 +2096,16 @@ def handle_command(cmd: str, duwo: DUWOClient, bot: TelegramBot, tracker: CycleT
             label = "OK" if len(booked) == count else "PARTIAL"
             lines = [f"[{label}] Booked {len(booked)} of {count} {kind}(s):"]
             for slot in booked:
-                lines.append(f"  {slot.date} {slot.start_time[:5]}-{slot.end_time}")
+                start_by = (
+                    datetime.strptime(
+                        f"{slot.date} {slot.start_time[:5]}", "%Y-%m-%d %H:%M"
+                    )
+                    + DUWOClient.START_GRACE
+                )
+                lines.append(
+                    f"  {slot.date} {slot.start_time[:5]}-{slot.end_time} "
+                    f"(start by {start_by:%H:%M})"
+                )
             if len(booked) < count:
                 lines.append(
                     duwo.last_error or "The remaining reservations were not confirmed."
@@ -2050,7 +2117,9 @@ def handle_command(cmd: str, duwo: DUWOClient, bot: TelegramBot, tracker: CycleT
         return
     if lower.startswith("/book"):
         bot.send(
-            "Usage: /book N or /book_dryer N. All machines use the same time window."
+            "Usage: /book N or /book_dryer N, e.g. /book 2. All machines share the "
+            "earliest time window with enough places today or tomorrow; DUWO "
+            "normally allows 2 open bookings."
         )
         return
 

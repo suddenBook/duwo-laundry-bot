@@ -28,8 +28,7 @@ its own clock, which `/done` calibrates against reality over time.
 - Timers survive a container restart
 - **Quiet by default** — availability and low-balance alerts are opt-in;
   connection problems can still trigger an alert
-- Reserves **any** time window, not just the whole hours DUWO's calendar
-  offers: `/book_at washer 23:17 23:57`
+- Reserves **any** time window of up to 2 hours, not just the whole hours DUWO's calendar offers: `/book_at washer 23:17 23:57`
 - `/status` shows free machines, your balance, your own bookings, and how full the booking calendar is for the coming hours — all in one message
 - `/status`, `/cycles`, `/done`, `/slots`, `/slots_dryer`, `/book`,
   `/book_dryer`, `/book_at`, `/bookings`, `/cancel`, `/balance`, `/qr`
@@ -38,8 +37,7 @@ its own clock, which `/done` calibrates against reality over time.
 - Reports unavailable data instead of claiming there are no bookings
 - Continues saved cycle timers during a DUWO outage, retries failed notifications,
   and persists Telegram command offsets to prevent replay after a restart
-- `/book N` finds a single window with enough capacity for all N machines;
-  partial success is reported explicitly
+- `/book N` finds the earliest single window today or tomorrow with enough places for all N machines (DUWO normally allows 2 open bookings); partial success is reported explicitly, and every reply says by when the machine must be started
 
 ## Environment
 

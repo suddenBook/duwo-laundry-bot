@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlparse
 
 from test_regressions import app, response
@@ -109,6 +109,8 @@ class Website:
         self.slot = booking()["start"]
         self.raw = f"45|{self.slot:%Y-%m-%d}|12:00:00|12:59"
         self.taken = []  # starts of hours booked by others
+        self.days = None  # {"YYYY-MM-DD": blocks} to serve calendars per date
+        self.confirm_reply = None  # what ConfirmCreateBooking.php says instead
 
     def calendar_blocks(self):
         blocks = [(start, "full") for start in self.taken]
@@ -139,6 +141,9 @@ class Website:
             return response(booking_html(self.mine))
         if path == "FindAvailableFromMachineType.php":
             self.machine = int(query["ObjectMachineTypeID"][0])
+            if self.days is not None:
+                day = query.get("Start_Date", [""])[0]
+                return response(calendar_html(self.days.get(day, [])))
             return response(calendar_html(self.calendar_blocks()))
         if path == "AnnouncmentBooking.php":
             if "ResNr" in query:
@@ -151,6 +156,8 @@ class Website:
                 f"<button id='BtnOkBooking'>Confirm</button><script>var Value = '{self.selected}';var ObjectMachineTypeID = '{self.machine}';</script>"
             )
         if path == "ConfirmCreateBooking.php":
+            if self.confirm_reply is not None:
+                return response(self.confirm_reply)
             if self.reject:
                 return response("Not available")
             return response(
@@ -396,6 +403,72 @@ class BookingFlows(unittest.TestCase):
             client.create_timed_booking(93, "2000-01-01", "12:00", "12:59")
         )
         self.assertEqual(site.calls, [])
+
+
+def frozen_now(stamp):
+    class Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return stamp
+
+    return patch.object(app, "datetime", Frozen)
+
+
+class BookingRules(unittest.TestCase):
+    def test_an_hour_duwo_still_offers_can_be_booked_after_it_began(self):
+        now = datetime(2026, 11, 9, 14, 10)
+        site = Website()
+        site.slot = now.replace(minute=0)
+        site.raw = "45|2026-11-09|14:00:00|14:59"
+        with frozen_now(now):
+            booked = site.client().book_multiple(93, 1)
+        self.assertEqual(len(booked), 1)
+        self.assertEqual(site.calls.count("CreateBooking.php"), 1)
+
+    def test_book_looks_at_tomorrow_when_today_is_full(self):
+        now = datetime(2026, 11, 9, 22, 30)
+        site = Website()
+        site.days = {
+            "2026-11-09": [(datetime(2026, 11, 9, 23), "full")],
+            "2026-11-10": [(datetime(2026, 11, 10, 0), 2)],
+        }
+        with frozen_now(now):
+            booked = site.client().book_multiple(93, 2)
+        self.assertEqual([(b.date, b.start_time) for b in booked], [("2026-11-10", "00:00:00")] * 2)
+
+    def test_room_change_aborts_before_anything_is_announced(self):
+        site = Website()
+        client = site.client()
+        slot = app.BookingSlot(
+            f"44|{site.slot:%Y-%m-%d}|12:17:00|12:57", "44", f"{site.slot:%Y-%m-%d}", "12:17", "12:57", 1, ""
+        )
+        self.assertIsNone(client._create_booking(slot, 93))
+        self.assertIn("room 45", client.last_error)
+        self.assertNotIn("AnnouncmentBooking.php", site.calls)
+
+    def test_duwo_refusal_is_quoted(self):
+        site = Website()
+        site.confirm_reply = "<div class='Msg'>Maximum number of bookings reached.</div><script>var x = 1;</script>"
+        client = site.client()
+        self.assertEqual(client.book_multiple(93, 1), [])
+        self.assertIn("Maximum number of bookings reached.", client.last_error)
+        self.assertNotIn("CreateBooking.php", site.calls)
+
+    def test_long_or_distant_windows_are_refused_before_sending(self):
+        site = Website()
+        client = site.client()
+        day = f"{site.slot:%Y-%m-%d}"
+        far = f"{datetime.now() + timedelta(days=20):%Y-%m-%d}"
+        self.assertIsNone(client.create_timed_booking(93, day, "08:00", "23:00"))
+        self.assertIn("2 hours", client.last_error)
+        self.assertIsNone(client.create_timed_booking(93, far, "12:00", "12:40"))
+        self.assertIn("14 days", client.last_error)
+        self.assertEqual(site.calls, [])
+
+    def test_old_overview_rows_stay_in_the_past(self):
+        now = datetime(2026, 11, 8, 12)
+        self.assertEqual(app.DUWOClient._booking_datetime(now, 4, 1, 10, 0), datetime(2026, 4, 1, 10))
+        self.assertEqual(app.DUWOClient._booking_datetime(now, 2, 29, 10, 0), datetime(2024, 2, 29, 10))
 
 
 class Reliability(unittest.TestCase):
