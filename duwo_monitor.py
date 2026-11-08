@@ -1815,15 +1815,28 @@ def _day_label(when: datetime, now: datetime) -> str:
     return when.strftime("%d-%m   ")
 
 
-def _calendar_rows(washers, dryers, now: datetime) -> list[str]:
-    """Places left per coming hour for washers and dryers, side by side."""
+def _calendar_rows(washers, dryers, now: datetime, mine=None) -> list[str]:
+    """Places left per coming hour for washers and dryers, side by side.
+
+    An hour is "yours" when one of our reservations overlaps it: DUWO lists
+    the places left in such an hour as a separate free block, and shows an
+    hour holding a custom /book_at window only as taken.
+    """
     if washers is None and dryers is None:
         return ["  unavailable (DUWO read failed)"]
     hours: dict[datetime, list[str]] = {}
-    for column, blocks in enumerate((washers, dryers)):
+    for column, (machine, blocks) in enumerate((("Washer", washers), ("Dryer", dryers))):
         for block in blocks or []:
-            state = "yours" if block.yours else str(block.free) if block.free else "full"
-            hours.setdefault(block.start, ["?", "?"])[column] = state
+            ours = block.yours or any(
+                b["machine"] == machine
+                and b["status"] == "BookingReady"
+                and b["start"] < block.end
+                and block.start < b["end"]
+                for b in mine or []
+            )
+            row = hours.setdefault(block.start, ["?", "?"])
+            if row[column] != "yours":
+                row[column] = "yours" if ours else str(block.free) if block.free else "full"
     if not hours:
         return ["  no more slots in the calendar"]
     lines = [f"  {'Hour':<12}{'Washer':<8}Dryer"]
@@ -1915,6 +1928,7 @@ def handle_command(cmd: str, duwo: DUWOClient, bot: TelegramBot, tracker: CycleT
                 duwo.get_room_calendar(WASHER_TYPE_ID),
                 duwo.get_room_calendar(DRYER_TYPE_ID),
                 stamp,
+                mine,
             )
         )
         bot.send(f"<pre>{html.escape(chr(10).join(rows))}</pre>")

@@ -30,6 +30,18 @@ class Commands(unittest.TestCase):
         self.assertIn(f"{label:<12}full    full", text)
         self.assertIn("Washer  Dryer", text)
 
+    def test_hours_with_our_booking_read_yours(self):
+        start = datetime(2026, 11, 9, 3)
+        Block = app.CalendarBlock
+        washers = [
+            Block(start, start.replace(minute=59), 0, yours=True),
+            Block(start, start.replace(minute=59), 1),
+        ]
+        dryers = [Block(start, start.replace(minute=59), 0)]
+        custom = booking(machine="Dryer", start=start.replace(minute=17))
+        rows = app._calendar_rows(washers, dryers, datetime(2026, 11, 8, 20), [custom])
+        self.assertEqual(rows[1], "  tmrw 03:00  yours   yours")
+
     def test_account_page_switch_can_take_one_extra_read(self):
         client = app.DUWOClient()
         client.logged_in = True
