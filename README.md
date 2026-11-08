@@ -17,7 +17,7 @@ this account:
 | washer, 14-09 | +35 min | +57 min | +22 min |
 
 So the bot ignores DUWO's idea of "finished". It anchors on the machine **start**
-(which DUWO does report accurately, to the second, in its activity log) and runs
+(which DUWO reports to the minute in its activity log) and runs
 its own clock, which `/done` calibrates against reality over time.
 
 ## Features
@@ -51,8 +51,7 @@ Required:
 
 Cycle tracking:
 
-- `WASHER_CYCLE_MINUTES` (default `55`) — real washer duration, start to door open;
-  the only value `/done` calibrates
+- `WASHER_CYCLE_MINUTES` (default `55`) — real washer duration, start to door open; the only value `/done` calibrates. Changing it restarts the learning from the new value
 - `DRYER_CYCLE_MINUTES` (default `40`) — dryer duration; accurate as advertised,
   so it is never adjusted by `/done`
 - `CYCLE_HEADSUP_MINUTES` (default `5`) — warning before ready, so you can walk down
@@ -100,12 +99,7 @@ STATE_PATH=./data/state.json uv run python duwo_monitor.py
 
 ## Notes
 
-- `/done` closes out washers started within 15 minutes of the most recent
-  washer, which is how loads are actually run — two or three back to back. It
-  calibrates from the *last* machine to start, since that is the one that
-  decides when the batch can be emptied. Only the washer is learned; the dryer
-  really does take its advertised 40 minutes, so a finished dryer closes itself
-  out and never asks for `/done`.
+- `/done` closes the washer whose estimated finish is nearest — the one the last "should be ready" message was about — together with washers started before it and any due within 5 minutes, so loads run back to back are emptied with one `/done` while a load started much later keeps running. Only that washer teaches the estimate, and only when its time is within 0.6–1.5× the current estimate. The dryer really does take its advertised 40 minutes, so a finished dryer closes itself out and never asks for `/done`.
 - `/book_at` books a window DUWO's own UI cannot express. `CreateBooking.php`
   can accept it and then return HTTP 500 while trying to draw the result into an
   hour grid — *after* committing — so the status code is ignored and the
@@ -114,9 +108,7 @@ STATE_PATH=./data/state.json uv run python duwo_monitor.py
   Such a booking can be invisible on the hour calendar; `/bookings` can still
   list it. `/book_at` returns the cancellation ID; `/cancel` also accepts the
   separate BookingNR from the activity log for compatibility.
-- On first run, past notifications are suppressed. Machines still running
-  retain their upcoming reminders. State migration preserves existing timers
-  and learned durations.
+- On first run, past notifications are suppressed. Machines still running retain their upcoming reminders. A machine first seen more than 30 minutes after its estimated finish, for example after downtime, is closed without a message. State migration preserves existing timers and learned durations.
 - `/balance` reads the dashboard selected by `main.php?page=home`, the site's own Home button; a second read covers DUWO rendering the previous page once more. Missing balance data is marked unavailable or last-known; recharge history and booking previews are never mistaken for the current balance.
 - `/qr` deliberately generates a new QR code each time, so a code someone
   photographed over your shoulder stops working.

@@ -202,13 +202,23 @@ class Cycle:
 # ============== Cycle Tracking ==============
 
 
+def _after(stamp: datetime, minutes: float) -> datetime:
+    """Local time `minutes` of real time after `stamp`, even across DST."""
+    return datetime.fromtimestamp(stamp.timestamp() + minutes * 60)
+
+
+def _minutes_between(start: datetime, end: datetime) -> float:
+    """Real minutes from `start` to `end`, even across DST."""
+    return (end.timestamp() - start.timestamp()) / 60.0
+
+
 class CycleTracker:
     """Runs our own clock over our own machines, and learns the real duration.
 
     DUWO frees a machine on a fixed timer measured from the terminal start
     (washer 35 min, dryer 40 min) which expires well before the door does, so
     its "finished" is not a usable "go collect it" signal.  We anchor instead
-    on the machine start -- which DUWO does report accurately, to the second --
+    on the machine start -- which DUWO's activity log reports to the minute --
     and count forward by a per-type duration that /done feedback calibrates.
     """
 
@@ -218,15 +228,21 @@ class CycleTracker:
     CALIBRATED = ("Washer",)
     MIN_MINUTES = 15.0
     MAX_MINUTES = 150.0
-    BATCH_WINDOW = timedelta(minutes=15)
+    # A /done far from the estimate is a late or early tap, not a cycle time.
+    PLAUSIBLE = (0.6, 1.5)
+    # Washers this close to their estimated finish are emptied with the batch.
+    DUE_SOON = timedelta(minutes=5)
+    # A machine first seen this long after its estimated finish is history.
+    LATE_GRACE = timedelta(minutes=30)
 
     def __init__(self, path: str):
         self.path = path
         self.cycles: dict[str, Cycle] = {}
-        self.duration = {
+        self.configured = {
             "Washer": float(WASHER_CYCLE_MINUTES),
             "Dryer": float(DRYER_CYCLE_MINUTES),
         }
+        self.duration = dict(self.configured)
         # Not a cycle, but this is the one file we already persist: the room id
         # is only ever printed on a *free* calendar slot, so a bot that starts
         # up on a fully booked day could not otherwise find it at all.
@@ -254,12 +270,20 @@ class CycleTracker:
         if re.fullmatch(r"[0-9]+", stored_location):
             self.location_id = stored_location
         durations = data.get("duration")
+        bases = data.get("duration_base")
+        bases = bases if isinstance(bases, dict) else {}
         for machine, value in (
             durations if isinstance(durations, dict) else {}
         ).items():
             if machine not in self.CALIBRATED:
                 # Not learned, so the configured value wins over whatever an
                 # older state file happens to hold.
+                continue
+            base = bases.get(machine)
+            if isinstance(base, (int, float)) and float(base) != self.configured[machine]:
+                # The configured duration was changed on purpose since this
+                # value was learned: start again from the new setting.
+                print(f"[INFO] {machine} duration reset to the configured value")
                 continue
             try:
                 minutes = float(value)
@@ -298,7 +322,7 @@ class CycleTracker:
                 cycle.collected_at = datetime.fromtimestamp(
                     cycle.collected_at.timestamp()
                 )
-            if cycle.started_at > datetime.now() + timedelta(minutes=1):
+            if cycle.started_at.timestamp() > time.time() + 60:
                 continue
             self.cycles[cycle.booking_nr] = cycle
         return True
@@ -308,6 +332,8 @@ class CycleTracker:
             "telegram_offset": self.telegram_offset,
             "cycle_baseline_set": self.cycle_baseline_set,
             "duration": self.duration,
+            # The configured value each learned duration started from.
+            "duration_base": {m: self.configured[m] for m in self.CALIBRATED},
             "location_id": self.location_id,
             "cycles": [
                 {
@@ -350,21 +376,28 @@ class CycleTracker:
         return self.duration.get(machine, float(WASHER_CYCLE_MINUTES))
 
     def eta(self, cycle: Cycle) -> datetime:
-        return cycle.started_at + timedelta(minutes=self.minutes_for(cycle.machine))
+        return _after(cycle.started_at, self.minutes_for(cycle.machine))
 
     def merge(self, observed: list[Cycle], suppress: bool) -> list[Cycle]:
         """Register cycles we have not seen before; return the new ones.
 
         On the very first run there is no state file, so every cycle still in
         the log would fire a burst of stale notifications.  `suppress` marks
-        them as already announced instead.
+        them as already announced instead. A machine first seen long after its
+        estimated finish (the bot was down) is closed without announcing it,
+        so it neither sends a stale message nor waits for a /done.
         """
         added = []
         now = datetime.now()
         for cycle in observed:
             if cycle.booking_nr in self.cycles:
                 continue
-            if suppress:
+            eta = self.eta(cycle)
+            if now >= eta + self.LATE_GRACE:
+                cycle.notified_start = cycle.notified_headsup = True
+                cycle.notified_done = True
+                cycle.collected_at = eta
+            elif suppress:
                 cycle.notified_start = True
                 cycle.notified_headsup = now >= self.eta(cycle) - timedelta(
                     minutes=CYCLE_HEADSUP_MINUTES
@@ -383,35 +416,41 @@ class CycleTracker:
         )
 
     def record_collected(self, now: datetime):
-        """Close out the most recent batch and calibrate from it.
+        """Close out the load the owner just emptied, and learn from it.
 
-        Washers started within BATCH_WINDOW of each other are one batch --
-        that is how they are actually used, two or three loads back to back.
-        Dryers close automatically and are not included here.
-        Calibration uses the LAST washer to start, because that is the one
-        that decides when the whole batch can be emptied.
+        The anchor is the washer whose estimated finish is nearest to `now`:
+        the one the last "should be ready" message was about. It is closed
+        with every washer started before it and any due within DUE_SOON, which
+        covers loads run back to back; a washer started well after it keeps
+        running. Only the anchor teaches the estimate, and only when its time
+        is plausible. Dryers close by themselves and are not included.
         """
         self.prune(now)
-        pending = [c for c in self.pending() if c.machine in self.CALIBRATED]
-        if not pending:
-            return [], None, None
-        newest = pending[-1]
-        batch = [
-            c for c in pending if newest.started_at - c.started_at <= self.BATCH_WINDOW
+        eligible = [
+            c
+            for c in self.pending()
+            if c.machine in self.CALIBRATED
+            and _minutes_between(c.started_at, now) >= self.MIN_MINUTES
         ]
-        observed = (now - newest.started_at).total_seconds() / 60.0
-        learned = None
-        if observed < self.MIN_MINUTES:
+        if not eligible:
             return [], None, None
-        if (
-            newest.machine in self.CALIBRATED
-            and self.MIN_MINUTES <= observed <= self.MAX_MINUTES
-        ):
-            previous = self.minutes_for(newest.machine)
+        anchor = min(
+            eligible, key=lambda c: abs(_minutes_between(self.eta(c), now))
+        )
+        batch = [
+            c
+            for c in eligible
+            if c.started_at <= anchor.started_at or self.eta(c) <= now + self.DUE_SOON
+        ]
+        observed = _minutes_between(anchor.started_at, now)
+        previous = self.minutes_for(anchor.machine)
+        learned = None
+        low, high = self.PLAUSIBLE
+        if low * previous <= observed <= high * previous:
             learned = self._clamp(
                 self.EWMA_ALPHA * observed + (1 - self.EWMA_ALPHA) * previous
             )
-            self.duration[newest.machine] = learned
+            self.duration[anchor.machine] = learned
         for cycle in batch:
             cycle.collected_at = now
         return batch, observed, learned
@@ -424,9 +463,7 @@ class CycleTracker:
         for cycle in self.cycles.values():
             if cycle.collected_at is None and cycle.started_at < stale:
                 changed = True
-                cycle.collected_at = cycle.started_at + timedelta(
-                    minutes=self.minutes_for(cycle.machine)
-                )
+                cycle.collected_at = self.eta(cycle)
 
         cutoff = now - timedelta(hours=max(CYCLE_LOOKBACK_HOURS * 2, 24))
         for key in [k for k, c in self.cycles.items() if c.started_at < cutoff]:
@@ -1865,9 +1902,14 @@ HELP_TEXT = """<b>DUWO Laundry Bot</b>
 /cancel 12345
 
 Cycle alerts are sent for your own machines. Connection alerts can also be sent. DUWO frees a machine well before its door actually opens, so the bot runs its own clock: washer {washer} min, dryer {dryer} min. Send /done when you really open the door and it learns your timings.
-""".replace("{washer}", str(WASHER_CYCLE_MINUTES)).replace(
-    "{dryer}", str(DRYER_CYCLE_MINUTES)
-)
+"""
+
+
+def help_text(tracker: CycleTracker) -> str:
+    """The help text with the cycle estimates the bot actually uses."""
+    return HELP_TEXT.replace(
+        "{washer}", f"{tracker.minutes_for('Washer'):.0f}"
+    ).replace("{dryer}", f"{tracker.minutes_for('Dryer'):.0f}")
 
 
 def _day_label(when: datetime, now: datetime) -> str:
@@ -1961,12 +2003,12 @@ def handle_command(
 
     # /help or /start
     if lower in ("/help", "/start"):
-        bot.send(HELP_TEXT)
+        bot.send(help_text(tracker))
         return
 
     # /status
     if lower == "/status":
-        poll_cycles(duwo, bot, tracker, suppress=not tracker.cycle_baseline_set)
+        fresh = poll_cycles(duwo, bot, tracker, suppress=not tracker.cycle_baseline_set)
         stamp = datetime.now()
         machines = duwo.get_availability()
         sep = "-" * 32
@@ -2010,8 +2052,11 @@ def handle_command(
                 )
 
         pending = tracker.pending()
-        if pending:
+        if pending or not fresh:
             rows.extend(["", "YOUR CYCLE ESTIMATES"])
+        if not fresh:
+            rows.append("  activity log unreadable: saved timers only")
+        if pending:
             for cycle in pending:
                 eta = tracker.eta(cycle)
                 state = (
@@ -2259,13 +2304,19 @@ def handle_command(
 
     # /cycles - what of ours is running right now
     if lower == "/cycles":
-        poll_cycles(duwo, bot, tracker, suppress=not tracker.cycle_baseline_set)
+        fresh = poll_cycles(duwo, bot, tracker, suppress=not tracker.cycle_baseline_set)
         pending = tracker.pending()
+        caveat = (
+            ""
+            if fresh
+            else "DUWO's activity log could not be read just now; this is from "
+            "the saved timers only, so a machine started since is missing.\n\n"
+        )
         if not pending:
-            bot.send("Nothing of yours is running.")
+            bot.send(caveat + "Nothing of yours is running.")
             return
         stamp = datetime.now()
-        lines = ["<b>Your machines:</b>", ""]
+        lines = ([caveat.strip(), ""] if caveat else []) + ["<b>Your machines:</b>", ""]
         for cycle in pending:
             eta = tracker.eta(cycle)
             left = (eta - stamp).total_seconds() / 60.0
@@ -2299,7 +2350,12 @@ def handle_command(
         if observed is not None:
             parts.append(f"That was {observed:.0f} min after starting.")
         if learned is not None:
-            parts.append(f"{batch[-1].machine} estimate is now {learned:.0f} min.")
+            parts.append(f"Washer estimate is now {learned:.0f} min.")
+        elif observed is not None:
+            parts.append(
+                f"That is too far from the {tracker.minutes_for('Washer'):.0f} min "
+                f"estimate to learn from."
+            )
         bot.send(" ".join(parts))
         return
 
@@ -2379,6 +2435,10 @@ def run():
     print("=" * 50)
 
     tracker = CycleTracker(STATE_PATH)
+    print(
+        f"  Estimates in use: washer {tracker.minutes_for('Washer'):.0f}min, "
+        f"dryer {tracker.minutes_for('Dryer'):.0f}min"
+    )
     bot = TelegramBot(store=tracker)
     duwo = DUWOClient(notify_callback=bot.send, store=tracker)
 
