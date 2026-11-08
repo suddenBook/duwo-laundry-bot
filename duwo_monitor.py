@@ -819,10 +819,12 @@ class DUWOClient:
                 kind = "login"
             else:
                 kind = "connection"
-            until = self._unblock_time(text) or (
-                time.time() + self.BLOCK_DEFAULT_SECONDS[kind]
-            )
-            when = datetime.fromtimestamp(until)
+            announced = self._unblock_time(text)
+            if announced:
+                when, until = announced
+            else:
+                until = time.time() + self.BLOCK_DEFAULT_SECONDS[kind]
+                when = datetime.fromtimestamp(until)
             stamp = when.strftime(
                 "%H:%M" if when.date() == datetime.now().date() else "%d-%m %H:%M"
             )
@@ -839,7 +841,9 @@ class DUWOClient:
                     f"again at {stamp}."
                 ),
             }[kind]
-        is_new = message != self._block_message or until > self._blocked_until + 60
+        # The message carries the time DUWO announced, so a notice still shown
+        # when the bot retries at that time is not reported a second time.
+        is_new = message != self._block_message
         self._blocked_until = until
         self._block_message = message
         if is_new:
@@ -848,12 +852,13 @@ class DUWOClient:
         raise DuwoBlocked(message)
 
     @staticmethod
-    def _unblock_time(text: str) -> float | None:
-        """The "try again after 21:05" time of a block notice, as a timestamp.
+    def _unblock_time(text: str) -> tuple[datetime, float] | None:
+        """The "try again after 21:05" time of a block notice, and when to retry.
 
-        A time that passed only a little while ago means the notice is still
-        being shown right at the end of the block, so retry shortly instead of
-        waiting until the same time tomorrow.
+        Blocks last hours, not days, so the announced time is the occurrence
+        nearest to now, whether that is yesterday evening seen just after
+        midnight or tomorrow morning. A time already passed means the notice is
+        still shown at the very end of the block: retry in a few minutes.
         """
         match = re.search(
             r"(?:try\s+again|after)\D{0,20}?(\d{1,2}):(\d{2})(?::(\d{2}))?", text, re.I
@@ -865,11 +870,12 @@ class DUWOClient:
             return None
         now = datetime.now()
         unlock = now.replace(hour=hour, minute=minute, second=second, microsecond=0)
-        if unlock <= now - timedelta(hours=6):
+        if unlock - now > timedelta(hours=12):
+            unlock -= timedelta(days=1)
+        elif now - unlock > timedelta(hours=12):
             unlock += timedelta(days=1)
-        elif unlock <= now:
-            unlock = now + timedelta(minutes=5)
-        return unlock.timestamp()
+        retry = unlock if unlock > now else now + timedelta(minutes=5)
+        return unlock, retry.timestamp()
 
     def _raise_if_blocked(self):
         if time.time() < self._blocked_until:
@@ -1005,6 +1011,20 @@ class DUWOClient:
     def login(self) -> bool:
         if self._is_login_blocked():
             return False
+        user = LOGIN_FORBIDDEN.sub("", EMAIL)
+        password = LOGIN_FORBIDDEN.sub("", PASSWORD)
+        if re.search(r"[<>]", user + password):
+            # DUWO's filter blocks these outright; logging in with them would
+            # block the connection again every time the last block lifted.
+            self._blocked_until = float("inf")
+            self._block_message = (
+                "The DUWO e-mail address or password contains < or >, which "
+                "DUWO blocks as an attack, so the bot will not log in. Change "
+                "the password on the DUWO website, update .env and restart."
+            )
+            print(f"[BLOCK] {self._block_message}")
+            self._send_alert(html.escape(self._block_message))
+            return False
         try:
             self.logged_in = False
             self.session.cookies.clear()
@@ -1013,10 +1033,7 @@ class DUWOClient:
             self._check_blocked(init_resp.text)
             resp = self.session.post(
                 f"{BASE_URL}/login/submit.php",
-                data={
-                    "UserInput": LOGIN_FORBIDDEN.sub("", EMAIL),
-                    "PwdInput": LOGIN_FORBIDDEN.sub("", PASSWORD),
-                },
+                data={"UserInput": user, "PwdInput": password},
                 allow_redirects=False,
                 timeout=20,
             )

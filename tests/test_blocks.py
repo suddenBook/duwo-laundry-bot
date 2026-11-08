@@ -78,13 +78,41 @@ class BlockNotices(unittest.TestCase):
         self.assertGreater(client._blocked_until, time.time() + 25 * 60)
 
     def test_a_block_time_that_just_passed_is_retried_soon_not_tomorrow(self):
-        with frozen_now(datetime(2026, 11, 8, 21, 5, 10)):
-            soon = app.DUWOClient._unblock_time("You can try again after 21:05.")
-            tomorrow = app.DUWOClient._unblock_time("You can try again after 03:00.")
-            later = app.DUWOClient._unblock_time("Try again @:23:30:00")
-        self.assertEqual(datetime.fromtimestamp(soon), datetime(2026, 11, 8, 21, 10, 10))
-        self.assertEqual(datetime.fromtimestamp(tomorrow), datetime(2026, 11, 9, 3, 0))
-        self.assertEqual(datetime.fromtimestamp(later), datetime(2026, 11, 8, 23, 30))
+        def retry(text, now):
+            with frozen_now(now):
+                return datetime.fromtimestamp(app.DUWOClient._unblock_time(text)[1])
+
+        evening = datetime(2026, 11, 8, 21, 5, 10)
+        self.assertEqual(retry("You can try again after 21:05.", evening), datetime(2026, 11, 8, 21, 10, 10))
+        self.assertEqual(retry("You can try again after 03:00.", evening), datetime(2026, 11, 9, 3, 0))
+        self.assertEqual(retry("Try again @:23:30:00", evening), datetime(2026, 11, 8, 23, 30))
+        after_midnight = datetime(2026, 11, 9, 0, 3)
+        self.assertEqual(retry("You can try again after 23:59.", after_midnight), datetime(2026, 11, 9, 0, 8))
+
+    def test_a_notice_still_shown_at_its_end_is_not_announced_again(self):
+        with frozen_now(datetime(2026, 11, 8, 18, 0)):
+            client, alerts = self.client(block_page("21:05"))
+            client.get_recent_cycles()
+        with frozen_now(datetime(2026, 11, 8, 21, 5, 30)):
+            client._blocked_until = 0.0
+            client.session.get = Mock(return_value=response(block_page("21:05")))
+            client.get_recent_cycles()
+        self.assertEqual(len(alerts), 1)
+        self.assertGreater(client._blocked_until, datetime(2026, 11, 8, 21, 10).timestamp())
+
+    def test_credentials_with_angle_brackets_are_never_sent(self):
+        alerts = []
+        client = app.DUWOClient(notify_callback=alerts.append)
+        client.session.get = Mock()
+        client.session.post = Mock()
+        with patch.object(app, "PASSWORD", "Tr0ub<4dor>&3"):
+            self.assertFalse(client.login())
+            self.assertFalse(client.login())
+        client.session.get.assert_not_called()
+        client.session.post.assert_not_called()
+        self.assertEqual(len(alerts), 1)
+        with self.assertRaises(app.DuwoBlocked):
+            client.ensure_login()
 
     def test_lifted_block_is_reported_once(self):
         client, alerts = self.client(
