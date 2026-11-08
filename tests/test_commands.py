@@ -2,7 +2,9 @@ from datetime import datetime, timedelta
 import io
 import json
 import tempfile
+import time
 import unittest
+from email.utils import formatdate
 from contextlib import redirect_stdout
 from unittest.mock import Mock, patch
 
@@ -301,6 +303,30 @@ class TelegramDelivery(unittest.TestCase):
         app.handle_command("/cancel@OtherBot 5", client, bot, Mock())
         bot.send.assert_not_called()
         client.cancel_booking.assert_not_called()
+
+    def test_command_age_is_measured_on_telegrams_clock(self):
+        # The NAS clock runs 15 minutes fast; Telegram says the message is new.
+        sent = int(time.time() - 15 * 60) - 30
+        data = {"ok": True, "result": [{"update_id": 7, "message": {"chat": {"id": "test"}, "text": "/book 1", "date": sent}}]}
+        reply = response(json.dumps(data))
+        reply.headers["Date"] = formatdate(time.time() - 15 * 60, usegmt=True)
+        with patch.object(app.requests, "get", return_value=reply):
+            [(text, sent_at)] = app.TelegramBot().poll_commands()
+        self.assertLess(abs((datetime.now() - sent_at).total_seconds() - 30), 5)
+        client = Mock()
+        client.book_multiple.return_value = []
+        client.last_error = None
+        app.handle_command(text, client, Mock(), Mock(), sent_at=sent_at)
+        client.book_multiple.assert_called_once()
+
+    def test_unverifiable_bot_name_gets_a_reply_not_silence(self):
+        client = Mock()
+        bot = Mock()
+        bot.username = None
+        bot.fetch_username.return_value = None
+        app.handle_command("/status@SomeBot", client, bot, Mock())
+        self.assertIn("without the @ part", bot.send.call_args.args[0])
+        client.get_availability.assert_not_called()
 
     def test_failed_qr_delivery_is_reported(self):
         client = Mock()

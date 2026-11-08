@@ -5,6 +5,7 @@ import html
 import io
 import math
 from decimal import Decimal, InvalidOperation
+from email.utils import parsedate_to_datetime
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
 import json
 import os
@@ -579,6 +580,7 @@ class TelegramBot:
             if not self._validate_response("getUpdates", resp):
                 return []
             data = resp.json()
+            skew = self._clock_skew(resp)
             commands = []
             for update in data.get("result", []):
                 update_id = update["update_id"]
@@ -594,8 +596,10 @@ class TelegramBot:
                 text = msg.get("text", "").strip()
                 if chat_id == TELEGRAM_CHAT_ID and text:
                     sent = msg.get("date")
+                    # Telegram dates the message by its own clock; shift it onto
+                    # ours so a NAS clock that is off cannot make it look stale.
                     sent_at = (
-                        datetime.fromtimestamp(sent)
+                        datetime.fromtimestamp(sent + skew)
                         if type(sent) is int and sent > 0
                         else None
                     )
@@ -604,6 +608,16 @@ class TelegramBot:
         except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
             print(f"[TG] poll error: {type(exc).__name__}")
             return []
+
+    @staticmethod
+    def _clock_skew(resp: requests.Response) -> float:
+        """Seconds our clock runs ahead of Telegram's, from the Date header."""
+        try:
+            server = parsedate_to_datetime(resp.headers["Date"]).timestamp()
+        except (KeyError, TypeError, ValueError, IndexError):
+            return 0.0
+        skew = time.time() - server
+        return skew if abs(skew) > 5 else 0.0
 
     def fetch_username(self) -> str | None:
         """Learn the bot's own @name, so "/status@ThisBot" in a group works."""
@@ -2012,7 +2026,15 @@ def handle_command(
         # is none of our business.
         word, _, target = word.partition("@")
         own = getattr(bot, "username", None)
-        if not isinstance(own, str) or target.lower() != own.lower():
+        if not isinstance(own, str) and callable(getattr(bot, "fetch_username", None)):
+            own = bot.fetch_username()
+        if not isinstance(own, str):
+            bot.send(
+                f"Could not check whether @{html.escape(target)} is this bot just "
+                f"now; send the command without the @ part."
+            )
+            return
+        if target.lower() != own.lower():
             return
     cmd = " ".join([word] + parts[1:])
     lower = cmd.lower()
@@ -2020,7 +2042,7 @@ def handle_command(
     if (
         sent_at is not None
         and word.lower() in CHANGING_COMMANDS
-        and now - sent_at > timedelta(minutes=STALE_COMMAND_MINUTES)
+        and _minutes_between(sent_at, now) > STALE_COMMAND_MINUTES
     ):
         bot.send(
             f"Skipped {html.escape(word)} sent at {sent_at:%H:%M}: it arrived while "
@@ -2510,45 +2532,46 @@ def run():
                     machines = duwo.get_availability()
 
                     if not machines:
+                        # Keep the last counts, so a change across a failed
+                        # read is still noticed on the next one.
                         print(f"[{ts}] Failed to get status")
-                        machines = []
+                    else:
+                        washer = next(
+                            (m for m in machines if "wash" in m.machine_type.lower()), None
+                        )
+                        dryer = next(
+                            (m for m in machines if "dry" in m.machine_type.lower()), None
+                        )
+                        w = washer.available_count if washer else None
+                        d = dryer.available_count if dryer else None
 
-                    washer = next(
-                        (m for m in machines if "wash" in m.machine_type.lower()), None
-                    )
-                    dryer = next(
-                        (m for m in machines if "dry" in m.machine_type.lower()), None
-                    )
-                    w = washer.available_count if washer else None
-                    d = dryer.available_count if dryer else None
+                        print(f"[{ts}] Washer: {w} | Dryer: {d}")
 
-                    print(f"[{ts}] Washer: {w} | Dryer: {d}")
+                        # Notify on current machine status thresholds
+                        if last_washer is not None and w is not None:
+                            if last_washer < WASHER_NOTIFY_THRESHOLD <= w:
+                                bot.send(
+                                    f"<b>Washers available now</b>\n\n"
+                                    f"Current free washers: {w}\n"
+                                    f"Alert threshold: {WASHER_NOTIFY_THRESHOLD}\n\n"
+                                    f"Use /status to check current machine status."
+                                )
+                            elif last_washer > 0 and w == 0:
+                                bot.send("All washers now occupied.")
 
-                    # Notify on current machine status thresholds
-                    if last_washer is not None and w is not None:
-                        if last_washer < WASHER_NOTIFY_THRESHOLD <= w:
-                            bot.send(
-                                f"<b>Washers available now</b>\n\n"
-                                f"Current free washers: {w}\n"
-                                f"Alert threshold: {WASHER_NOTIFY_THRESHOLD}\n\n"
-                                f"Use /status to check current machine status."
-                            )
-                        elif last_washer > 0 and w == 0:
-                            bot.send("All washers now occupied.")
+                        if last_dryer is not None and d is not None:
+                            if last_dryer < DRYER_NOTIFY_THRESHOLD <= d:
+                                bot.send(
+                                    f"<b>Dryers available now</b>\n\n"
+                                    f"Current free dryers: {d}\n"
+                                    f"Alert threshold: {DRYER_NOTIFY_THRESHOLD}\n\n"
+                                    f"Use /status to check current machine status."
+                                )
+                            elif last_dryer > 0 and d == 0:
+                                bot.send("All dryers now occupied.")
 
-                    if last_dryer is not None and d is not None:
-                        if last_dryer < DRYER_NOTIFY_THRESHOLD <= d:
-                            bot.send(
-                                f"<b>Dryers available now</b>\n\n"
-                                f"Current free dryers: {d}\n"
-                                f"Alert threshold: {DRYER_NOTIFY_THRESHOLD}\n\n"
-                                f"Use /status to check current machine status."
-                            )
-                        elif last_dryer > 0 and d == 0:
-                            bot.send("All dryers now occupied.")
-
-                    last_washer = w
-                    last_dryer = d
+                        last_washer = w
+                        last_dryer = d
 
                 # 4. Low-balance alert, off unless NOTIFY_LOW_BALANCE is set
                 if NOTIFY_LOW_BALANCE and now - last_balance_check >= 600:
