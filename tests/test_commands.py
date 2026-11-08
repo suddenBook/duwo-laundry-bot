@@ -223,7 +223,7 @@ class TelegramDelivery(unittest.TestCase):
             "result": [
                 {
                     "update_id": 42,
-                    "message": {"chat": {"id": "test"}, "text": "/book 1"},
+                    "message": {"chat": {"id": "test"}, "text": "/book 1", "date": 1794211200},
                 }
             ],
         }
@@ -233,7 +233,9 @@ class TelegramDelivery(unittest.TestCase):
             with patch.object(
                 app.requests, "get", return_value=response(json.dumps(data))
             ) as get:
-                self.assertEqual(bot.poll_commands(), ["/book 1"])
+                self.assertEqual(
+                    bot.poll_commands(), [("/book 1", datetime.fromtimestamp(1794211200))]
+                )
             restored = app.TelegramBot(app.CycleTracker(tracker.path))
             self.assertEqual(restored.last_update_id, 42)
             self.assertEqual(get.call_args.kwargs["params"]["limit"], 1)
@@ -259,6 +261,54 @@ class TelegramDelivery(unittest.TestCase):
             ):
                 self.assertEqual(bot.poll_commands(), [])
             self.assertEqual(bot.last_update_id, 0)
+
+    def test_stale_changes_are_skipped_but_reads_still_answer(self):
+        late = datetime.now() - timedelta(minutes=45)
+        client = Mock()
+        client.get_balance.return_value = "5.00"
+        client.balance_stale = False
+        bot = Mock()
+        for command in ["/book 2", "/book_at washer 23:00 23:40", "/cancel 5", "/qr"]:
+            app.handle_command(command, client, bot, Mock(), sent_at=late)
+            self.assertIn("Skipped", bot.send.call_args.args[0])
+        client.book_multiple.assert_not_called()
+        client.create_timed_booking.assert_not_called()
+        client.cancel_booking.assert_not_called()
+        client.get_qr_text.assert_not_called()
+        app.handle_command("/balance", client, bot, Mock(), sent_at=late)
+        self.assertEqual(bot.send.call_args.args[0], "Balance: EUR 5.00")
+
+    def test_done_counts_from_when_it_was_sent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tracker = app.CycleTracker(tmp + "/state.json")
+            sent = datetime.now() - timedelta(minutes=40)
+            tracker.cycles["1"] = app.Cycle("1", "Washer", sent - timedelta(minutes=56))
+            client = Mock()
+            client.get_recent_cycles.return_value = []
+            bot = Mock()
+            app.handle_command("/done", client, bot, tracker, sent_at=sent)
+        self.assertIn("That was 56 min after starting", bot.send.call_args.args[0])
+
+    def test_commands_with_this_bots_name_work_and_others_are_ignored(self):
+        client = Mock()
+        client.get_balance.return_value = "5.00"
+        client.balance_stale = False
+        bot = Mock()
+        bot.username = "DuwoLaundryBot"
+        app.handle_command("/balance@duwolaundrybot", client, bot, Mock())
+        self.assertEqual(bot.send.call_args.args[0], "Balance: EUR 5.00")
+        bot.reset_mock()
+        app.handle_command("/cancel@OtherBot 5", client, bot, Mock())
+        bot.send.assert_not_called()
+        client.cancel_booking.assert_not_called()
+
+    def test_failed_qr_delivery_is_reported(self):
+        client = Mock()
+        client.get_qr_text.return_value = "<ID>42</ID>"
+        bot = Mock()
+        bot.send_photo.return_value = False
+        app.handle_command("/qr", client, bot, Mock())
+        self.assertIn("Send /qr again", bot.send.call_args.args[0])
 
     def test_unauthorized_chat_cannot_dispatch(self):
         data = {

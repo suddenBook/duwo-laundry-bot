@@ -126,9 +126,7 @@ STATE_PATH=./data/state.json uv run python duwo_monitor.py
   prepared operation aborts it; the bot never resumes a half-prepared change
   in a fresh session. If the final outcome cannot be verified, check `/bookings`
   before retrying.
-- Telegram command offsets are saved before executing each command. A process
-  interruption can leave that command unanswered; it will not be automatically
-  executed again. Pending later commands remain queued.
+- Telegram command offsets are saved before executing each command. A process interruption can leave that command unanswered; it will not be automatically executed again. Pending later commands remain queued, but one that changes something at DUWO (`/book`, `/book_dryer`, `/book_at`, `/cancel`, `/qr`) is skipped with a note when it arrives more than 10 minutes after it was sent, and `/done` counts from the moment it was sent. In a group chat, commands addressed `/status@ThisBot` work and commands for other bots are ignored.
 - Network errors on the NAS can still delay fresh website data. Saved timers
   continue, and the status output distinguishes DUWO's free count from your
   estimated physical completion time.

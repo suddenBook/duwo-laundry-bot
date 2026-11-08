@@ -444,6 +444,7 @@ class TelegramBot:
     def __init__(self, store=None):
         self._state_store = store
         self.last_update_id = store.telegram_offset if store else 0
+        self.username: str | None = None  # learned from getMe
 
     def _validate_response(self, action: str, resp: requests.Response) -> bool:
         if not resp.ok:
@@ -520,7 +521,8 @@ class TelegramBot:
             print(f"[TG] send_photo error: {type(e).__name__}")
             return False
 
-    def poll_commands(self) -> list[str]:
+    def poll_commands(self) -> list[tuple[str, datetime | None]]:
+        """New commands from the owner's chat, each with when it was sent."""
         try:
             resp = requests.get(
                 f"{TG_API}/getUpdates",
@@ -549,11 +551,29 @@ class TelegramBot:
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 text = msg.get("text", "").strip()
                 if chat_id == TELEGRAM_CHAT_ID and text:
-                    commands.append(text)
+                    sent = msg.get("date")
+                    sent_at = (
+                        datetime.fromtimestamp(sent)
+                        if type(sent) is int and sent > 0
+                        else None
+                    )
+                    commands.append((text, sent_at))
             return commands
         except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
             print(f"[TG] poll error: {type(exc).__name__}")
             return []
+
+    def fetch_username(self) -> str | None:
+        """Learn the bot's own @name, so "/status@ThisBot" in a group works."""
+        try:
+            resp = requests.get(f"{TG_API}/getMe", timeout=10)
+            if self._validate_response("getMe", resp):
+                name = resp.json().get("result", {}).get("username")
+                if isinstance(name, str) and name:
+                    self.username = name
+        except (requests.RequestException, ValueError, AttributeError) as exc:
+            print(f"[WARN] Could not read the bot's own name: {type(exc).__name__}")
+        return self.username
 
     def set_commands(self) -> bool:
         commands = [
@@ -1900,10 +1920,44 @@ def _reservation_state(booking: dict, now: datetime) -> str:
     )
 
 
-def handle_command(cmd: str, duwo: DUWOClient, bot: TelegramBot, tracker: CycleTracker):
+# Commands that change something at DUWO; run hours late they would book a
+# window nobody asked for any more or invalidate a QR code in use.
+STALE_COMMAND_MINUTES = 10
+CHANGING_COMMANDS = ("/book", "/book_washer", "/book_dryer", "/book_at", "/cancel", "/qr")
+
+
+def handle_command(
+    cmd: str,
+    duwo: DUWOClient,
+    bot: TelegramBot,
+    tracker: CycleTracker,
+    sent_at: datetime | None = None,
+):
     """Process a Telegram command and reply."""
-    cmd = cmd.strip()
+    parts = cmd.strip().split(maxsplit=1)
+    if not parts:
+        return
+    word = parts[0]
+    if "@" in word:
+        # In a group Telegram appends the bot's name; a command for another bot
+        # is none of our business.
+        word, _, target = word.partition("@")
+        own = getattr(bot, "username", None)
+        if not isinstance(own, str) or target.lower() != own.lower():
+            return
+    cmd = " ".join([word] + parts[1:])
     lower = cmd.lower()
+    now = datetime.now()
+    if (
+        sent_at is not None
+        and word.lower() in CHANGING_COMMANDS
+        and now - sent_at > timedelta(minutes=STALE_COMMAND_MINUTES)
+    ):
+        bot.send(
+            f"Skipped {html.escape(word)} sent at {sent_at:%H:%M}: it arrived while "
+            f"the bot could not answer. Send it again if you still want it."
+        )
+        return
 
     # /help or /start
     if lower in ("/help", "/start"):
@@ -2196,7 +2250,11 @@ def handle_command(cmd: str, duwo: DUWOClient, bot: TelegramBot, tracker: CycleT
         img = qrcode.make(qr_text)
         buf = io.BytesIO()
         img.save(buf, format="PNG")
-        bot.send_photo(buf.getvalue(), caption="Laundry QR Code")
+        if not bot.send_photo(buf.getvalue(), caption="Laundry QR Code"):
+            bot.send(
+                "DUWO made a new QR code, so the previous one no longer works, "
+                "but sending it failed. Send /qr again."
+            )
         return
 
     # /cycles - what of ours is running right now
@@ -2225,8 +2283,11 @@ def handle_command(cmd: str, duwo: DUWOClient, bot: TelegramBot, tracker: CycleT
 
     # /done - confirm collection, and calibrate from it
     if lower == "/done":
+        # When the owner sent it, not when it was processed, is when the door
+        # was opened; a /done delivered late must not learn a longer cycle.
+        collected = min(now, sent_at) if sent_at else now
         poll_cycles(duwo, bot, tracker, suppress=not tracker.cycle_baseline_set)
-        batch, observed, learned = tracker.record_collected(datetime.now())
+        batch, observed, learned = tracker.record_collected(collected)
         if not batch:
             bot.send(
                 "No eligible load is waiting for /done (at least 15 minutes after starting)."
@@ -2322,30 +2383,30 @@ def run():
     duwo = DUWOClient(notify_callback=bot.send, store=tracker)
 
     bot.set_commands()
+    bot.fetch_username()
 
     if not tracker.cycle_baseline_set:
         print("[INFO] No state file yet: existing log entries will not be announced.")
 
     last_washer = None
     last_dryer = None
-    last_check = 0
-    last_cycle_check = 0
-    last_balance_check = 0
+    # Monotonic, so a clock step on the NAS cannot stall the schedule.
+    last_check = last_cycle_check = last_balance_check = float("-inf")
     low_balance_notified = False
 
     while True:
         try:
             # 1. Process Telegram commands
-            for cmd in bot.poll_commands():
+            for cmd, sent_at in bot.poll_commands():
                 cmd_name = cmd.split()[0] if cmd else cmd
                 print(f"[CMD] {cmd_name}")
                 try:
-                    handle_command(cmd, duwo, bot, tracker)
+                    handle_command(cmd, duwo, bot, tracker, sent_at=sent_at)
                 except Exception:
                     traceback.print_exc()
                     bot.send("Something went wrong handling that command.")
 
-            now = time.time()
+            now = time.monotonic()
 
             # Checks the bot makes on its own leave the DUWO session to the
             # owner for a while after a login elsewhere ended it.
@@ -2363,8 +2424,7 @@ def run():
 
                     if not machines:
                         print(f"[{ts}] Failed to get status")
-                        last_check = now - CHECK_INTERVAL + 15
-                        continue
+                        machines = []
 
                     washer = next(
                         (m for m in machines if "wash" in m.machine_type.lower()), None
