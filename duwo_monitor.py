@@ -6,7 +6,7 @@ import io
 import math
 from collections import Counter
 from decimal import Decimal, InvalidOperation
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
 import json
 import os
 import re
@@ -33,7 +33,11 @@ if os.path.exists(_env_path):
             _line = _line.strip()
             if _line and not _line.startswith("#") and "=" in _line:
                 _k, _v = _line.split("=", 1)
-                os.environ.setdefault(_k.strip(), _v.strip())
+                _v = _v.strip()
+                # Accept KEY="value" the way docker compose's env_file does.
+                if len(_v) >= 2 and _v[0] == _v[-1] and _v[0] in "\"'":
+                    _v = _v[1:-1]
+                os.environ.setdefault(_k.strip(), _v)
 
 _REQUIRED_VARS = [
     "DUWO_EMAIL",
@@ -115,10 +119,30 @@ STATE_PATH = (os.environ.get("STATE_PATH") or "/data/state.json").strip()
 # "45|2026-09-14|17:00:00|17:59").  Normally discovered from the calendar and
 # remembered, so this is only an escape hatch for when DUWO stops printing it.
 LOCATION_ID = (os.environ.get("DUWO_LOCATION_ID") or "").strip()
+if LOCATION_ID and not re.fullmatch(r"[0-9]+", LOCATION_ID):
+    print(f"[WARN] DUWO_LOCATION_ID={LOCATION_ID!r} is not a number; detecting it")
+    LOCATION_ID = ""
 
 WASHER_TYPE_ID = 93
 DRYER_TYPE_ID = 94
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+# DUWO's attack filter blocks the whole internet connection for hours when a
+# request carries a character it does not accept. The login page strips these
+# from the e-mail address and password before submitting, so the bot does too.
+LOGIN_FORBIDDEN = re.compile(r"[\"'`,/\\]")
+# Every value the bot puts in a URL is a number, a date, a time or a booking
+# value joined by "|"; anything else is refused before it is sent.
+SAFE_QUERY_NAME = re.compile(r"[A-Za-z0-9_]+")
+SAFE_QUERY_VALUE = re.compile(r"[A-Za-z0-9 ._@|:+-]*")
+
+
+class DuwoUnavailable(RuntimeError):
+    """DUWO cannot be asked right now; the message says why and until when."""
+
+
+class DuwoBlocked(DuwoUnavailable):
+    """DUWO refuses this connection or this account for a while."""
 
 
 # ============== Data ==============
@@ -208,7 +232,7 @@ class CycleTracker:
         self.telegram_offset = offset if type(offset) is int and offset >= 0 else 0
         self.cycle_baseline_set = data.get("cycle_baseline_set", True) is True
         stored_location = str(data.get("location_id") or "").strip()
-        if stored_location.isdigit():
+        if re.fullmatch(r"[0-9]+", stored_location):
             self.location_id = stored_location
         durations = data.get("duration")
         for machine, value in (
@@ -246,7 +270,7 @@ class CycleTracker:
                 continue
             if (
                 cycle.machine not in ("Washer", "Dryer")
-                or not cycle.booking_nr.isdigit()
+                or not re.fullmatch(r"[0-9]+", cycle.booking_nr)
             ):
                 continue
             if cycle.started_at.tzinfo is not None:
@@ -552,6 +576,7 @@ class DUWOClient:
     # Login cooldown: exponential backoff on repeated failures
     LOGIN_COOLDOWN_BASE = 60  # first retry after 60s
     LOGIN_COOLDOWN_MAX = 1800  # cap at 30 minutes
+    LOGIN_RETRY_MAX = 300  # cap for network errors: 5 minutes
     LOGIN_COOLDOWN_MULTIPLIER = 2
 
     def __init__(self, notify_callback=None, store=None):
@@ -572,8 +597,12 @@ class DUWOClient:
         self.last_error = None
         # Login rate-limiting state
         self._login_fail_count = 0
+        self._login_alerted = False
         self._login_cooldown_until = 0.0  # timestamp: don't attempt login before this
-        self._locked_until = 0.0  # timestamp: account lockout detected
+        # A block notice from DUWO pauses every request until it lifts.
+        self._blocked_until = 0.0
+        self._block_message = ""
+        self._last_warning = ("", 0.0)
         self._notify = notify_callback  # optional callable(str) for Telegram alerts
         self._location_set = False  # has LocNR been set in this session?
         self._state_store = store  # CycleTracker, for the room id
@@ -584,7 +613,12 @@ class DUWOClient:
 
     def _set_error(self, message: str):
         self.last_error = message
-        print(f"[WARN] {message}")
+        # A block or an outage repeats the same warning every poll; log it once
+        # per half hour instead of filling the container log.
+        previous, logged_at = self._last_warning
+        if message != previous or time.time() - logged_at >= 1800:
+            print(f"[WARN] {message}")
+            self._last_warning = (message, time.time())
 
     def _send_alert(self, message: str):
         """Send a Telegram notification if callback is configured."""
@@ -595,12 +629,9 @@ class DUWOClient:
                 pass
 
     def _is_login_blocked(self) -> bool:
-        """Check if we should NOT attempt login due to cooldown or lockout."""
+        """Check if we should NOT attempt login due to cooldown or a block."""
         now = time.time()
-        if self._locked_until > now:
-            remaining = int(self._locked_until - now)
-            mins, secs = divmod(remaining, 60)
-            print(f"[LOCK] Account locked, {mins}m{secs}s remaining")
+        if self._blocked_until > now:
             return True
         if self._login_cooldown_until > now:
             remaining = int(self._login_cooldown_until - now)
@@ -610,92 +641,148 @@ class DUWOClient:
 
     def _on_login_success(self):
         """Reset cooldown state after successful login."""
-        if self._login_fail_count > 0:
+        if self._login_alerted:
             self._send_alert("Login restored successfully.")
         self._login_fail_count = 0
+        self._login_alerted = False
         self._login_cooldown_until = 0.0
-        self._locked_until = 0.0
 
-    def _on_login_failure(self):
-        """Apply exponential backoff after a login failure."""
+    def _on_login_failure(self, rejected: bool):
+        """Apply exponential backoff after a login failure.
+
+        Only a login DUWO actually refused is worth a message; an unreachable
+        website is already visible in the log and in every command's reply.
+        """
         self._login_fail_count += 1
         cooldown = min(
             self.LOGIN_COOLDOWN_BASE
             * (self.LOGIN_COOLDOWN_MULTIPLIER ** min(self._login_fail_count - 1, 10)),
-            self.LOGIN_COOLDOWN_MAX,
+            # Keep retrying an unreachable website often enough to notice soon
+            # that it is back; only refused logins back off all the way.
+            self.LOGIN_COOLDOWN_MAX if rejected else self.LOGIN_RETRY_MAX,
         )
         self._login_cooldown_until = time.time() + cooldown
         print(
             f"[WAIT] Login failed ({self._login_fail_count}x), next attempt in {int(cooldown)}s"
         )
-        if self._login_fail_count == 1:
+        if rejected and not self._login_alerted:
+            self._login_alerted = True
             self._send_alert(
-                f"<b>Login failed</b>\nNext attempt in {int(cooldown)}s.\n"
+                f"<b>Login failed</b>\nDUWO did not accept the login. "
+                f"Next attempt in {int(cooldown)}s.\n"
                 f"If this persists, check your credentials."
             )
 
-    def _detect_lockout(self, resp_text: str) -> bool:
-        """Check login response for account lockout, set _locked_until if found.
+    BLOCK_DEFAULT_SECONDS = {"connection": 3 * 3600, "login": 1800, "account": 6 * 3600}
 
-        Known lockout page format from DUWO:
-            "Locked after too many login attempts !"
-            "Try again @:20:28:19"
-            "click here after :20:28:19"
+    def _check_blocked(self, markup: str):
+        """Recognise DUWO's block notices and pause all requests until they lift.
+
+        Instead of the requested page DUWO then answers with a short notice:
+        "Temporarily blocked" (error code 101) for the whole internet
+        connection, "Your account is blocked" (error code 101-<number>) for
+        the account, or a lock after too many logins. A request its filter
+        rejects first gets "report abuse to admin", and the block follows.
         """
-        lower = resp_text.lower()
-        # Extract unlock time — formats: "@:HH:MM:SS", "after :HH:MM:SS", etc.
-        time_patterns = [
-            r"(?:try again|after)\s*@?\s*:?\s*(\d{1,2}:\d{2}(?::\d{2})?)",
-            r"click here after\s*:?\s*(\d{1,2}:\d{2}(?::\d{2})?)",
-        ]
-        for pat in time_patterns:
-            m = re.search(pat, lower)
-            if m:
-                return self._set_lockout_from_time(m.group(1))
-        # Generic lockout detection without parseable time
-        if any(
-            kw in lower
-            for kw in (
-                "locked after too many",
-                "too many login",
-                "too many attempts",
-                "geblokkeerd",
-                "error 101",
-            )
+        lower = markup.lower()
+        if not any(
+            hint in lower
+            for hint in ("blockmessage", "report abuse", "locked after too many")
         ):
-            # Default lockout: 30 minutes
-            self._locked_until = time.time() + 1800
-            unlock_str = datetime.fromtimestamp(self._locked_until).strftime("%H:%M")
-            print(f"[LOCK] Account locked! Estimated unlock at {unlock_str}")
-            self._send_alert(
-                f"<b>Account locked!</b>\n"
-                f"Too many login attempts detected.\n"
-                f"Will retry around {unlock_str}."
+            return
+        soup = BeautifulSoup(markup, "html.parser")
+        notice = soup.find(class_="BlockMessage") or soup
+        text = " ".join(notice.get_text(" ").split())
+        code = re.search(r"error\s+code\s*:?\s*(101(?:\s*-\s*\d+)?)", text, re.I)
+        code = re.sub(r"\s+", "", code.group(1)) if code else "101"
+        if "blockmessage" not in lower and "report abuse" in lower:
+            kind = "connection"
+            message = (
+                "DUWO rejected a request as unsafe and will block this internet "
+                "connection for a few hours."
             )
-            return True
-        return False
+            until = time.time() + 1800
+        else:
+            if "-" in code or re.search(r"account\s+is\s+blocked", text, re.I):
+                kind = "account"
+            elif re.search(r"too\s+many|locked\s+after", text, re.I):
+                kind = "login"
+            else:
+                kind = "connection"
+            until = self._unblock_time(text) or (
+                time.time() + self.BLOCK_DEFAULT_SECONDS[kind]
+            )
+            when = datetime.fromtimestamp(until)
+            stamp = when.strftime(
+                "%H:%M" if when.date() == datetime.now().date() else "%d-%m %H:%M"
+            )
+            message = {
+                "connection": (
+                    f"DUWO has temporarily blocked this internet connection "
+                    f"(error code {code}) until {stamp}. Another device or app on "
+                    f"the same connection can cause this too."
+                ),
+                "login": f"DUWO locked the login after too many attempts until {stamp}.",
+                "account": (
+                    f"DUWO has blocked this account (error code {code}). Ask the "
+                    f"administrator of your location to lift it; the bot tries "
+                    f"again at {stamp}."
+                ),
+            }[kind]
+        is_new = message != self._block_message or until > self._blocked_until + 60
+        self._blocked_until = until
+        self._block_message = message
+        if is_new:
+            print(f"[BLOCK] {message}")
+            self._send_alert(f"<b>DUWO access paused</b>\n{html.escape(message)}")
+        raise DuwoBlocked(message)
 
-    def _set_lockout_from_time(self, time_str: str) -> bool:
-        """Parse an HH:MM or HH:MM:SS lockout time and set _locked_until."""
-        try:
-            parts = time_str.split(":")
-            h, m = int(parts[0]), int(parts[1])
-            second = int(parts[2]) if len(parts) > 2 else 0
-            now = datetime.now()
-            unlock = now.replace(hour=h, minute=m, second=second, microsecond=0)
-            if unlock <= now:
-                unlock += timedelta(days=1)
-            self._locked_until = unlock.timestamp()
-            unlock_str = unlock.strftime("%H:%M")
-            print(f"[LOCK] Account locked until {unlock_str}")
-            self._send_alert(
-                f"<b>Account locked!</b>\n"
-                f"Too many login attempts.\n"
-                f"Auto-retry at {unlock_str}."
-            )
-            return True
-        except (ValueError, IndexError):
-            return False
+    @staticmethod
+    def _unblock_time(text: str) -> float | None:
+        """The "try again after 21:05" time of a block notice, as a timestamp.
+
+        A time that passed only a little while ago means the notice is still
+        being shown right at the end of the block, so retry shortly instead of
+        waiting until the same time tomorrow.
+        """
+        match = re.search(
+            r"(?:try\s+again|after)\D{0,20}?(\d{1,2}):(\d{2})(?::(\d{2}))?", text, re.I
+        )
+        if not match:
+            return None
+        hour, minute, second = (int(part or 0) for part in match.groups())
+        if hour > 23 or minute > 59 or second > 59:
+            return None
+        now = datetime.now()
+        unlock = now.replace(hour=hour, minute=minute, second=second, microsecond=0)
+        if unlock <= now - timedelta(hours=6):
+            unlock += timedelta(days=1)
+        elif unlock <= now:
+            unlock = now + timedelta(minutes=5)
+        return unlock.timestamp()
+
+    def _raise_if_blocked(self):
+        if time.time() < self._blocked_until:
+            raise DuwoBlocked(self._block_message)
+
+    def _block_lifted(self):
+        """Report once that DUWO answers normally again after a block."""
+        if self._block_message:
+            print("[OK] DUWO answers again")
+            self._send_alert("DUWO answers again; the block has been lifted.")
+            self._block_message = ""
+            self._blocked_until = 0.0
+
+    @staticmethod
+    def _check_outgoing(url: str):
+        """Refuse to send a parameter DUWO's attack filter could block us for."""
+        for name, value in parse_qsl(urlparse(url).query, keep_blank_values=True):
+            if not SAFE_QUERY_NAME.fullmatch(name) or not SAFE_QUERY_VALUE.fullmatch(
+                value
+            ):
+                raise ValueError(
+                    f"Refusing to send an unexpected {name!r} value to DUWO."
+                )
 
     def _is_auth_redirect(self, resp: requests.Response) -> bool:
         body = resp.text.lower()
@@ -725,13 +812,12 @@ class DUWOClient:
         allow_http_error: bool = False,
     ) -> requests.Response:
         """Retry only reads; callers disable retries throughout a prepared mutation."""
+        self._check_outgoing(url)
         self.ensure_login()
         try:
             if init_location:
                 self._init_location()
-            resp = self.session.get(url, timeout=20)
-            if self._is_auth_redirect(resp):
-                raise PermissionError("DUWO session expired")
+            resp = self._fetch(url)
         except PermissionError:
             self.logged_in = False
             if not allow_retry:
@@ -739,14 +825,28 @@ class DUWOClient:
                     "DUWO session expired; the operation was not retried."
                 )
             self.ensure_login()
-            if init_location:
-                self._init_location()
-            resp = self.session.get(url, timeout=20)
-            if self._is_auth_redirect(resp):
+            try:
+                if init_location:
+                    self._init_location()
+                resp = self._fetch(url)
+            except PermissionError:
+                # Back off as for a failed login, so a session DUWO keeps
+                # dropping cannot turn every read into two more logins.
                 self.logged_in = False
+                self._on_login_failure(rejected=False)
                 raise RuntimeError("DUWO rejected the renewed session.")
         if not allow_http_error:
             resp.raise_for_status()
+        return resp
+
+    def _fetch(self, url: str) -> requests.Response:
+        """One GET that stops at a block notice and reports a lost session."""
+        self._raise_if_blocked()
+        resp = self.session.get(url, timeout=20)
+        self._check_blocked(resp.text)
+        self._block_lifted()
+        if self._is_auth_redirect(resp):
+            raise PermissionError("DUWO session expired")
         return resp
 
     @staticmethod
@@ -798,15 +898,18 @@ class DUWOClient:
             self.session.cookies.clear()
             init_resp = self.session.get(f"{BASE_URL}/login/index.php", timeout=20)
             init_resp.raise_for_status()
-            if self._detect_lockout(init_resp.text):
-                return False
+            self._check_blocked(init_resp.text)
             resp = self.session.post(
                 f"{BASE_URL}/login/submit.php",
-                data={"UserInput": EMAIL, "PwdInput": PASSWORD},
+                data={
+                    "UserInput": LOGIN_FORBIDDEN.sub("", EMAIL),
+                    "PwdInput": LOGIN_FORBIDDEN.sub("", PASSWORD),
+                },
                 allow_redirects=False,
                 timeout=20,
             )
             resp.raise_for_status()
+            self._check_blocked(resp.text)
             if "StartSite.php" in resp.text:
                 match = re.search(r"document\.location\s*=\s*'([^']+)'", resp.text)
                 if match:
@@ -816,43 +919,42 @@ class DUWOClient:
                     self.start_url = redirect
                     landing = self.session.get(redirect, timeout=20)
                     landing.raise_for_status()
+                    self._check_blocked(landing.text)
                     if self._is_auth_redirect(landing):
                         raise RuntimeError("Login redirect was not authenticated")
                 else:
                     raise RuntimeError("DUWO did not provide a login destination")
-                # LocNR is deliberately NOT set here: it sticks to the PHP
-                # session and flips BookingOverview.php from our own bookings
-                # to the whole location.  Calls that need it pass
-                # init_location=True.
+                # LocNR is deliberately NOT set here: calls that need the room
+                # selected pass init_location=True.
                 self._location_set = False
                 self.logged_in = True
+                self._block_lifted()
                 self._on_login_success()
                 print("[OK] Login successful")
                 return True
-            # Check for account lockout in the failed response
-            if self._detect_lockout(resp.text):
-                return False
             print("[FAIL] Login failed")
-            self._on_login_failure()
+            self._on_login_failure(rejected=True)
+            return False
+        except DuwoBlocked:
             return False
         except Exception as e:
             print(f"[ERROR] Login: {e}")
-            self._on_login_failure()
+            self._on_login_failure(rejected=False)
             return False
 
     def _init_location(self):
         if self._location_set:
             return
-        resp = self.session.get(f"{BASE_URL}/findmachinetypes.php", timeout=20)
-        if self._is_auth_redirect(resp):
-            raise PermissionError("DUWO session expired")
+        resp = self._fetch(f"{BASE_URL}/findmachinetypes.php")
         resp.raise_for_status()
         if "findmachinetypes" not in resp.text.lower():
             raise RuntimeError("Could not select the laundry room")
         self._location_set = True
 
     def ensure_login(self):
+        self._raise_if_blocked()
         if not self.logged_in and not self.login():
+            self._raise_if_blocked()
             raise RuntimeError(
                 "DUWO login unavailable; retry after the login cooldown."
             )
@@ -1226,7 +1328,7 @@ class DUWOClient:
             # An explicit override outranks whatever the calendar says.
             return LOCATION_ID
         value = (value or "").strip()
-        if not value:
+        if not re.fullmatch(r"[0-9]+", value):
             return None
         if value != self._room_id:
             self._room_id = value
@@ -1900,9 +2002,7 @@ def poll_cycles(
     observed = duwo.get_recent_cycles()
     stamp = datetime.now()
     changed = tracker.prune(stamp)
-    if observed is None:
-        print(f"[WARN] {duwo.last_error or 'cycle poll failed'}")
-    else:
+    if observed is not None:
         changed = bool(tracker.merge(observed, suppress=suppress)) or changed
         if not tracker.cycle_baseline_set:
             tracker.cycle_baseline_set = True
