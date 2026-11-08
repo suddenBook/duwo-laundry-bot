@@ -418,12 +418,14 @@ class CycleTracker:
     def record_collected(self, now: datetime):
         """Close out the load the owner just emptied, and learn from it.
 
-        The anchor is the washer whose estimated finish is nearest to `now`:
-        the one the last "should be ready" message was about. It is closed
-        with every washer started before it and any due within DUE_SOON, which
-        covers loads run back to back; a washer started well after it keeps
-        running. Only the anchor teaches the estimate, and only when its time
-        is plausible. Dryers close by themselves and are not included.
+        The anchor is the washer the last "should be ready" message was about:
+        of the washers due by now (or within DUE_SOON), the one whose estimated
+        finish is nearest. With none due yet a door was opened early, and the
+        washer started first is the one emptied. The anchor is closed with
+        every washer started before it and any due within DUE_SOON, which
+        covers loads run back to back; a washer still running keeps running.
+        Only the anchor teaches the estimate, and only when its time is
+        plausible. Dryers close by themselves and are not included.
         """
         self.prune(now)
         eligible = [
@@ -434,8 +436,11 @@ class CycleTracker:
         ]
         if not eligible:
             return [], None, None
-        anchor = min(
-            eligible, key=lambda c: abs(_minutes_between(self.eta(c), now))
+        due = [c for c in eligible if self.eta(c) <= now + self.DUE_SOON]
+        anchor = (
+            min(due, key=lambda c: abs(_minutes_between(self.eta(c), now)))
+            if due
+            else eligible[0]
         )
         batch = [
             c

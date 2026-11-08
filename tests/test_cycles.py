@@ -33,6 +33,23 @@ class Done(unittest.TestCase):
         self.assertIsNotNone(learned)
         self.assertIsNone(second.collected_at)
 
+    def test_a_washer_not_yet_due_is_left_running_even_if_its_finish_is_nearer(self):
+        # Started 20 minutes apart; the first is emptied 11 minutes after its
+        # ready message, when the second's finish is only 9 minutes away.
+        first = self.washer("1", self.estimate + 11)
+        second = self.washer("2", self.estimate - 9)
+        batch, observed, _ = self.tracker.record_collected(self.now)
+        self.assertEqual(batch, [first])
+        self.assertAlmostEqual(observed, self.estimate + 11, places=3)
+        self.assertIsNone(second.collected_at)
+
+    def test_a_door_opened_early_closes_the_oldest_washer(self):
+        first = self.washer("1", self.estimate - 10)
+        second = self.washer("2", self.estimate - 25)
+        batch, _, _ = self.tracker.record_collected(self.now)
+        self.assertEqual(batch, [first])
+        self.assertIsNone(second.collected_at)
+
     def test_back_to_back_loads_are_emptied_together(self):
         loads = [self.washer("1", self.estimate + 3), self.washer("2", self.estimate)]
         loads.append(self.washer("3", self.estimate - 3))
