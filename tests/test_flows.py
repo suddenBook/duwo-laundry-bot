@@ -27,13 +27,45 @@ def booking(
 
 
 def booking_html(rows):
-    body = '<div id="BookingOverviewTable"><table><tr><th>Date</th></tr>'
+    # Markup of DUWO's BookingOverview.php: both identifiers sit in commented-out
+    # cells, the status is the class of the machine label.
+    body = (
+        "<h2>Your bookings</h2><br>\n<div id='BookingTable'><table class='ColorTable'>"
+        "<tr><!--<th></th>--><th><p class='TxtHeader'>Date</p></th>"
+        "<th><p class='TxtHeader'>Time</p></th><!--<th>Booking</th>-->"
+        "<th><p class='TxtHeader'>Loc.</p></th><th><p class='TxtHeader'>machine</p></th></tr>"
+    )
     for b in rows:
-        # The actual site puts both identifiers in comments, not visible cells.
-        body += f"""<tr><!--<td onclick='RemoveBooking({b["id"]})'><p>{b["booking_nr"]}</p></td>-->
-        <td>{b["start"]:%d-%m}</td><td>{b["start"]:%H:%M}-&gt;{b["end_label"]}</td>
-        <td>ROOM</td><td><p class='{b["status"]}'>{"Washing mach" if b["machine"] == "Washer" else "Dryer"}</p></td></tr>"""
-    return body + "</table></div>"
+        label = "Washing mach" if b["machine"] == "Washer" else "Dryer"
+        body += f"""<tr><!--
+        <td class='link' onclick='RemoveBooking({b["id"]})' align='center'><i class='fa fa-times'></i></td>
+        --><td align='center'><p class=''>{b["start"]:%d-%m}</p></td>
+        <td align='center'><p class=''>{b["start"]:%H:%M}->{b["end_label"]}</p></td><!--
+        <td class='link' onclick='RemoveBooking({b["id"]})' align='center'><p class=''>{b["booking_nr"]}</p></td>
+        --><td align='center'><p class=''>ROOM</p></td>
+        <td align='center'><p class='{b["status"]}'>{label}</p></td></tr>"""
+    if not rows:
+        body += "<tr><td class='EmptyRow' colspan='4'>No bookings</td></tr>"
+    return body + "</table></div></div>"
+
+
+def userlog_html(entries):
+    """DUWO's UserLog.php for (time, action, detail, amount) entries, oldest first."""
+    body = (
+        "<table id='UserLogTable' class='ColorTable'>\n<tr>\n<th>Time</th>\n"
+        "<th>Activity</th>\n<th>Amount</th>\n<th>Balance</th>\n</tr>\n"
+    )
+    day = None
+    for at, action, detail, amount in reversed(entries):
+        if at.date() != day:
+            day = at.date()
+            body += f"<tr class='LogDay'><td colspan='4'>{at:%a} {at.day} {at:%b %Y}</td></tr>\n"
+        cost = f"<span class='LogMin'>{amount}</span>" if amount else ""
+        body += (
+            f"<tr>\n<td>{at:%H:%M}</td>\n<td><span class='LogAction'>{action}</span>"
+            f"<span class='LogDetail'>{detail}</span></td>\n<td>{cost}</td>\n<td></td>\n</tr>\n"
+        )
+    return body + "</table><p class='TransHistoryMsg'>Only the latest 250 entries are shown.</p>"
 
 
 class Website:
@@ -41,6 +73,7 @@ class Website:
 
     def __init__(self):
         self.mine = []
+        self.log = []
         self.room = [booking("999", booking_nr="888")]
         self.scope = "own"
         self.machine = None
@@ -62,9 +95,9 @@ class Website:
         if path == self.expire_at:
             return response("<script>document.location='../index.html';</script>")
         if path == "UserLog.php":
-            return response('<div id="UserLogTable"><table></table></div>')
+            return response(userlog_html(self.log))
         if path == "main.php":
-            if query.get("page") == ["user.php"]:
+            if query.get("page") == ["home"]:
                 self.scope = "own"
             return response(
                 "<script>var ParentFile='user.php';</script><span id='LblUserCredits'>81,00</span>"
@@ -419,10 +452,10 @@ class Reliability(unittest.TestCase):
     def test_exact_paid_id_wins_over_unrelated_nearby_debit(self):
         now = datetime.now()
         rows = [
-            dict(at=now, action="Depreciation on location", info="Washing mach"),
-            dict(at=now, action="Booking Started", info="BookingNR : 23"),
-            dict(at=now, action="Booking Payd", info="123 -> 200"),
-            dict(at=now, action="Booking Payd", info="23 -> 100"),
+            dict(at=now, action="depreciation on location", info="VM · Washing Mach."),
+            dict(at=now, action="booking started", info="VM · Booking 23"),
+            dict(at=now, action="booking paid", info="VM · Booking 123: 2,00"),
+            dict(at=now, action="booking paid", info="VM · Booking 23: 1,00"),
         ]
         self.assertEqual(app.DUWOClient._machine_from_context(rows, 1, "23"), "Dryer")
 

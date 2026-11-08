@@ -606,6 +606,8 @@ class DUWOClient:
         self._notify = notify_callback  # optional callable(str) for Telegram alerts
         self._location_set = False  # has LocNR been set in this session?
         self._state_store = store  # CycleTracker, for the room id
+        self._log_unreadable = False  # alerted that UserLog.php cannot be parsed
+        self._unattributed: set[str] = set()  # starts with an unknown machine
         self._room_id = LOCATION_ID or (store.location_id if store else None)
 
     def _clear_error(self):
@@ -960,15 +962,35 @@ class DUWOClient:
             )
 
     def _account_home(self) -> requests.Response:
-        # main.php alone renders the last selected PHP page, which may be a calendar.
-        # Explicitly selecting user.php restores both the credits and personal scope.
-        # DUWO can render the previous page once before applying this selection.
+        # main.php renders whichever page the PHP session showed last, often a
+        # calendar; page=home, the site's own Home button, selects the
+        # dashboard with the balance. A second read covers DUWO rendering the
+        # previous page once more.
         for _ in range(2):
-            resp = self._get(f"{BASE_URL}/main.php?page=user.php")
+            resp = self._get(f"{BASE_URL}/main.php?page=home")
             if re.search(r"ParentFile\s*=\s*['\"]user\.php['\"]", resp.text, re.I):
                 self._location_set = False
                 return resp
         raise RuntimeError("DUWO did not return the account page")
+
+    @staticmethod
+    def _available_count(cell) -> int | None:
+        """Free machines in an availability cell, or None if unrecognised.
+
+        Reads "2 available" and "Available : 2"; "Not available" or the
+        TxtNotAvailable label means none.
+        """
+        text = cell.get_text(" ", strip=True)
+        match = re.search(r"(\d+)\s+available\b", text, re.I) or re.search(
+            r"\bavailable\s*:\s*(\d+)", text, re.I
+        )
+        if match:
+            return int(match.group(1))
+        if re.search(r"\bnot\s+available\b", text, re.I) or cell.find(
+            class_="TxtNotAvailable"
+        ):
+            return 0
+        return None
 
     def get_availability(self) -> list[MachineStatus]:
         self._clear_error()
@@ -983,19 +1005,12 @@ class DUWOClient:
             for row in table.find_all("tr"):
                 cells = row.find_all("td")
                 if len(cells) >= 3:
-                    status_text = cells[2].get_text(strip=True)
-                    count = None
-                    m = re.search(r"\bAvailable\s*:\s*(\d+)", status_text, re.I)
-                    if m:
-                        count = int(m.group(1))
-                    elif re.fullmatch(r"Not\s+Available", status_text, re.I):
-                        count = 0
                     machines.append(
                         MachineStatus(
                             location=cells[0].get_text(strip=True),
                             machine_type=cells[1].get_text(strip=True),
-                            status=status_text,
-                            available_count=count,
+                            status=cells[2].get_text(" ", strip=True),
+                            available_count=self._available_count(cells[2]),
                         )
                     )
             return machines
@@ -1341,15 +1356,21 @@ class DUWOClient:
             self._account_home()
 
     def _parse_bookings(self, markup: str, *, own: bool) -> list[dict]:
-        table = BeautifulSoup(markup, "html.parser").find(id="BookingOverviewTable")
+        soup = BeautifulSoup(markup, "html.parser")
+        table = soup.find(id="BookingTable") or soup.find(id="BookingOverviewTable")
         if table is None:
             raise ValueError("DUWO did not return a booking overview.")
         now = datetime.now()
         bookings = []
         for row in table.find_all("tr"):
-            cells = [td.get_text(" ", strip=True) for td in row.find_all("td")]
+            tds = row.find_all("td")
+            cells = [td.get_text(" ", strip=True) for td in tds]
             if not cells:
                 continue
+            if len(tds) == 1 and (
+                "EmptyRow" in (tds[0].get("class") or []) or tds[0].get("colspan")
+            ):
+                continue  # the "no bookings" placeholder of an empty table
             if len(cells) < 4:
                 raise ValueError(
                     "Unrecognized booking row; refusing an incomplete schedule."
@@ -1417,9 +1438,10 @@ class DUWOClient:
 
     @staticmethod
     def _machine_name(text: str) -> str | None:
-        if "wash" in text.lower():
+        # Whole words only: a terminal or room called "...laundry" is no dryer.
+        if re.search(r"\b(?:wash|wasmachine|wasautomaat)", text, re.I):
             return "Washer"
-        if "dry" in text.lower():
+        if re.search(r"\b(?:dry|droger)", text, re.I):
             return "Dryer"
         return None
 
@@ -1473,88 +1495,146 @@ class DUWOClient:
             raise ValueError("Invalid booking date.")
         return min(candidates, key=lambda stamp: abs(stamp - now))
 
+    LOG_MONTHS = {
+        "jan": 1, "feb": 2, "mar": 3, "mrt": 3, "apr": 4, "may": 5, "mei": 5,
+        "jun": 6, "jul": 7, "aug": 8, "sep": 9, "oct": 10, "okt": 10,
+        "nov": 11, "dec": 12,
+    }  # fmt: skip
+    # What a start at the payment terminal costs tells which machine it was.
+    START_PRICES = {Decimal("2.00"): "Washer", Decimal("1.00"): "Dryer"}
+
     def get_recent_cycles(self) -> list[Cycle] | None:
-        """Parse our own machine starts out of UserLog.php.
+        """Our own machine starts within the lookback window, from UserLog.php.
 
-        UserLog.php is always scoped to the logged-in account.  BookingOverview.php
-        is NOT: once LocNR is set in the PHP session (which any init_location=True
-        call does, via findmachinetypes.php) it switches to listing the whole
-        location's bookings instead of ours, so it must not be used for this.
+        UserLog.php is the account's activity log, newest first and grouped
+        under day headers ("Sun 8 Nov 2026"). Oldest first, a start at the
+        payment terminal reads:
 
-        A terminal start looks like:
+            09:49  Request balance           VM_DuwoSCP2
+            09:49  Depreciation on location  VM_DuwoSCP2 · Washing Mach.   -2,00
+            09:49  Create booking            VM_DuwoSCP2 · Booking 8170551
+            09:49  Booking started           VM_DuwoSCP2 · Booking 8170551
+            09:50  Booking paid              VM_DuwoSCP2 · Booking 8170551: 2,00
 
-            16:12:28  Depreciation on location  -2,00  Washing Mach.
-            16:12:37  Booking Started                  BookingNR : 8005487
-            16:12:39  Booking Payd                     8005487 ->  200
-
-        Prefer a payment matched to the exact booking ID (200 = EUR 2.00 =
-        washer, 100 = dryer), then use an adjacent machine-specific debit.
+        The payment names the exact booking and its amount the machine; the
+        debit just before the start is the fallback.
         """
         self._clear_error()
         try:
             resp = self._get(f"{BASE_URL}/UserLog.php")
-            soup = BeautifulSoup(resp.text, "html.parser")
-            rows = []
-            for row in soup.find_all("tr"):
-                cells = [td.get_text(" ", strip=True) for td in row.find_all("td")]
-                if len(cells) < 3:
-                    continue
-                try:
-                    stamp = datetime.strptime(cells[0], "%Y-%m-%d %H:%M:%S")
-                except ValueError:
-                    continue
-                cells = (cells + [""] * 6)[:6]
-                rows.append({"at": stamp, "action": cells[2], "info": cells[5]})
-            if not rows and not soup.find(id=re.compile(r"UserLog", re.I)):
-                self._set_error("Could not read the DUWO activity log.")
-                return None
-            rows.sort(key=lambda r: r["at"])
-            cutoff = datetime.now() - timedelta(hours=CYCLE_LOOKBACK_HOURS)
-            cycles = []
-            for index, row in enumerate(rows):
-                if row["action"] != "Booking Started" or row["at"] < cutoff:
-                    continue
-                match = re.search(r"BookingNR\s*:\s*(\d+)", row["info"])
-                if not match:
-                    continue
-                machine = self._machine_from_context(rows, index, match.group(1))
-                if machine is None:
-                    continue
-                cycles.append(
-                    Cycle(
-                        booking_nr=match.group(1),
-                        machine=machine,
-                        started_at=row["at"],
-                    )
-                )
-            return cycles
         except Exception as exc:
             self._set_error(f"Could not read the DUWO activity log: {exc}")
             return None
+        try:
+            rows = self._parse_user_log(resp.text)
+        except Exception as exc:
+            # A layout the parser no longer understands would otherwise look
+            # exactly like a quiet laundry room, so say so once.
+            self._set_error(f"Could not read the DUWO activity log: {exc}")
+            if not self._log_unreadable:
+                self._log_unreadable = True
+                self._send_alert(
+                    "<b>Cannot read DUWO's activity log</b>\n"
+                    f"{html.escape(str(exc))}\n"
+                    "Machine-start alerts are paused until it can be read again."
+                )
+            return None
+        self._log_unreadable = False
+        rows.reverse()
+        rows.sort(key=lambda row: row["at"])  # stable: same-minute rows keep order
+        cutoff = datetime.now() - timedelta(hours=CYCLE_LOOKBACK_HOURS)
+        cycles = []
+        for index, row in enumerate(rows):
+            if row["action"] != "booking started" or row["at"] < cutoff:
+                continue
+            number = self._log_booking_nr(row["info"])
+            if number is None:
+                continue
+            machine = self._machine_from_context(rows, index, number)
+            if machine is None:
+                if number not in self._unattributed:
+                    self._unattributed.add(number)
+                    print(f"[WARN] Could not tell which machine booking {number} started")
+                continue
+            cycles.append(Cycle(booking_nr=number, machine=machine, started_at=row["at"]))
+        return cycles
+
+    @classmethod
+    def _parse_user_log(cls, markup: str) -> list[dict]:
+        """UserLog.php entries in page order (newest first): at, action, info."""
+        table = BeautifulSoup(markup, "html.parser").find(id="UserLogTable")
+        if table is None:
+            raise ValueError("DUWO did not return the activity log.")
+        rows, day, skipped = [], None, 0
+        for row in table.find_all("tr"):
+            cells = row.find_all("td")
+            if not cells:
+                continue  # column headers
+            if "LogDay" in (row.get("class") or []):
+                day = cls._log_day(cells[0].get_text(" ", strip=True))
+                continue
+            if len(cells) == 1:
+                continue  # the placeholder row of an empty log
+            clock = re.fullmatch(
+                r"(\d{1,2}):(\d{2})(?::(\d{2}))?", cells[0].get_text(strip=True)
+            )
+            action = row.find(class_="LogAction")
+            if day is None or clock is None or action is None:
+                skipped += 1
+                continue
+            hour, minute, second = (int(part or 0) for part in clock.groups())
+            detail = row.find(class_="LogDetail")
+            rows.append(
+                dict(
+                    at=day.replace(hour=hour, minute=minute, second=second),
+                    action=" ".join(action.get_text(" ").split()).lower(),
+                    info=" ".join(detail.get_text(" ").split()) if detail else "",
+                )
+            )
+        if skipped and not rows:
+            raise ValueError("the activity log has a layout the bot does not know.")
+        return rows
+
+    @classmethod
+    def _log_day(cls, text: str) -> datetime:
+        """The date of an activity log day header such as "Sun 8 Nov 2026"."""
+        match = re.search(r"\b(\d{1,2})\s+([A-Za-z]{3})[A-Za-z]*\.?\s+(\d{4})\b", text)
+        month = cls.LOG_MONTHS.get(match.group(2).lower()) if match else None
+        if month is None:
+            raise ValueError(f"unrecognised day {text[:40]!r} in the activity log.")
+        return datetime(int(match.group(3)), month, int(match.group(1)))
 
     @staticmethod
+    def _log_booking_nr(info: str) -> str | None:
+        match = re.search(r"\bBooking\s*(?:NR)?\s*:?\s*(\d+)", info, re.I)
+        return match.group(1) if match else None
+
+    @classmethod
     def _machine_from_context(
-        rows: list[dict], index: int, booking_nr: str
+        cls, rows: list[dict], index: int, booking_nr: str
     ) -> str | None:
         started = rows[index]["at"]
         window = timedelta(minutes=3)
-        # Payment rows carry the exact booking ID; adjacent debits can belong
-        # to a different machine started at nearly the same time.
+        # The payment carries the exact booking number; a debit nearby could
+        # belong to another machine started at nearly the same time.
         for row in rows:
-            if abs(row["at"] - started) > window or row["action"] != "Booking Payd":
+            if row["action"] != "booking paid" or abs(row["at"] - started) > window:
                 continue
-            paid = re.fullmatch(r"\s*(\d+)\s*->\s*(\d+)\s*", row["info"])
+            paid = re.search(
+                r"\bBooking\s+(\d+)\s*:\s*(\d+(?:[.,]\d{1,2})?)", row["info"]
+            )
             if paid and paid.group(1) == booking_nr:
-                machine = {200: "Washer", 100: "Dryer"}.get(int(paid.group(2)))
-                if machine:
-                    return machine
+                amount = Decimal(paid.group(2).replace(",", "."))
+                if amount in cls.START_PRICES:
+                    return cls.START_PRICES[amount]
         for row in reversed(rows[:index]):
             if started - row["at"] > window:
                 break
-            if row["action"] == "Booking Started":
-                break
-            if row["action"] == "Depreciation on location":
-                return DUWOClient._machine_name(row["info"])
+            number = cls._log_booking_nr(row["info"])
+            if number is not None and number != booking_nr:
+                break  # rows of another booking: a different start
+            if row["action"] == "depreciation on location":
+                return cls._machine_name(row["info"].split("·")[-1])
         return None
 
     def get_qr_text(self) -> str | None:
@@ -1562,13 +1642,18 @@ class DUWOClient:
         self._clear_error()
         try:
             resp = self._get(f"{BASE_URL}/GenUserQrcode.php?GenNew=TRUE")
+            holder = BeautifulSoup(resp.text, "html.parser").find(
+                attrs={"data-qrtext": True}
+            )
+            if holder and holder["data-qrtext"].strip():
+                return holder["data-qrtext"].strip()
             m = re.search(r'"text"\s*:\s*"([^"]+)"', resp.text)
             if m:
                 return m.group(1)
             self._set_error("DUWO did not return a QR text value.")
             return None
-        except Exception:
-            self._set_error("get_qr_text failed.")
+        except Exception as exc:
+            self._set_error(f"Could not get a new QR code: {exc}")
             return None
 
 

@@ -120,14 +120,11 @@ STATE_PATH=./data/state.json uv run python duwo_monitor.py
 - On first run, past notifications are suppressed. Machines still running
   retain their upcoming reminders. State migration preserves existing timers
   and learned durations.
-- `/balance` explicitly selects `main.php?page=user.php`. DUWO sometimes renders
-  the previous page once, so the account page is checked with at most two reads.
-  Missing balance data is marked unavailable or last-known; recharge history
-  and booking previews are never mistaken for the current balance.
+- `/balance` reads the dashboard selected by `main.php?page=home`, the site's own Home button; a second read covers DUWO rendering the previous page once more. Missing balance data is marked unavailable or last-known; recharge history and booking previews are never mistaken for the current balance.
 - `/qr` deliberately generates a new QR code each time, so a code someone
   photographed over your shoulder stops working.
-- Machine-start detection reads `UserLog.php`, which is always scoped to the
-  logged-in account. `BookingOverview.php` is *not*: once `LocNR` is set in the
+- Machine-start detection reads `UserLog.php`, the account's activity log, which lists entries per day to the minute. A start is matched to its machine by the payment row carrying the exact booking number (EUR 2.00 washer, EUR 1.00 dryer), or else by the machine named on the debit just before it. If the log's layout cannot be read, the bot says so once rather than mistaking it for a quiet laundry room.
+- `BookingOverview.php` is *not* always scoped to the account: once `LocNR` is set in the
   PHP session it lists the whole location's bookings instead, so it must not be
   used for this. Personal booking reads restore account scope before parsing
   any cancellation IDs. The shared overview only shows the rows DUWO exposes;

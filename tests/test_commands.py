@@ -29,7 +29,7 @@ class Commands(unittest.TestCase):
         client = app.DUWOClient()
         client.logged_in = True
         client._location_set = True
-        old = response("<script>var ParentFile='main.php';</script>Room page")
+        old = response("<script>var ParentFile='findavailablefrommachinetype.php';</script>")
         current = response(
             "<script>var ParentFile='user.php';</script><span id='LblUserCredits'>81,00</span>"
         )
